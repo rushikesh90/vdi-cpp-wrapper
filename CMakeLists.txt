@@ -7,4 +7,8 @@ include_directories(include)
 
 add_executable(vdi_wrapper
     src/main.cpp
+    src/vdi_client.cpp
+    src/backup_engine.cpp
+    src/backup_session.cpp
+    src/sink.cpp
 )
