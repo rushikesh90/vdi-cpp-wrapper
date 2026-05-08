@@ -1,4 +1,5 @@
 #include "backup_engine.h"
+#include <cstdio>
 
 int main() {
     BackupRequest req;

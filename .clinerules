@@ -1,0 +1,57 @@
+# .clinerules
+
+# Project: vdi_wrapper
+# Description: This file documents the high‑level code structure and the
+# responsibilities of each component in the VDI wrapper project.
+
+# 1. include/vdi_client.h
+#    - Provides the VdiClient class interface.
+#    - On Windows builds includes <windows.h>, <vdi.h>, and <combaseapi.h>.
+#    - Defines a placeholder implementation for non‑Windows platforms to allow
+#      compilation without the actual VDI SDK.
+#    - Exposes:
+#        * IClientVirtualDeviceSet2* device_set_;
+#        * bool connect(const std::wstring&, int);
+#        * Destructor releases COM object and calls CoUninitialize() on Windows.
+
+# 2. src/vdi_client.cpp
+#    - Implements VdiClient.
+#    - Windows path:
+#        * Calls CoInitializeEx(COINIT_MULTITHREADED).
+#        * Uses CoCreateInstance to obtain CLSID_MSSQL_ClientVirtualDeviceSet.
+#        * Configures VDConfig and calls device_set_->CreateEx().
+#        * Returns true on success.
+#    - Non‑Windows path:
+#        * Returns true as a stub.
+
+# 3. include/backup_request.h
+#    - Defines BackupRequest struct with database name, backup type,
+#      device count, buffer size, and device name.
+
+# 4. include/backup_engine.h / src/backup_engine.cpp
+#    - BackupEngine orchestrates a backup session.
+#    - start_backup():
+#        * Creates a VdiClient instance.
+#        * Calls client->connect() with request parameters.
+#        * Creates a NullSink (placeholder sink implementation).
+#        * Constructs BackupSession with the client and sink.
+#        * Runs the session.
+
+# 5. src/main.cpp
+#    - Entry point for the application.
+#    - Constructs a BackupRequest, sets database and type.
+#    - Instantiates BackupEngine and starts the backup.
+
+# 6. CMakeLists.txt
+#    - Sets C++17 standard.
+#    - Includes the 'include' directory.
+#    - Builds the vdi_wrapper executable from the source files.
+#    - Links against ole32.lib (required for COM on Windows).
+
+# 7. Build notes
+#    - On Windows, the project must be built with a compiler that can locate
+#      the VDI SDK headers (vdi.h) and libraries.
+#    - On non‑Windows platforms the placeholder definitions allow the code to
+#      compile, but the VDI functionality will be a no‑op.
+
+# End of .clinerules

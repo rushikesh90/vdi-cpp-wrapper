@@ -12,3 +12,5 @@ add_executable(vdi_wrapper
     src/backup_session.cpp
     src/sink.cpp
 )
+
+target_link_libraries(vdi_wrapper ole32)
