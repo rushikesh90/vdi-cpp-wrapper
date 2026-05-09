@@ -11,6 +11,7 @@ add_executable(vdi_wrapper
     src/backup_engine.cpp
     src/backup_session.cpp
     src/sink.cpp
+    src/sqlvdi_guids.cpp
 )
 
-target_link_libraries(vdi_wrapper ole32)
+target_link_libraries(vdi_wrapper ole32 uuid)

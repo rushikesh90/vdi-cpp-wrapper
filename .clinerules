@@ -42,16 +42,59 @@
 #    - Constructs a BackupRequest, sets database and type.
 #    - Instantiates BackupEngine and starts the backup.
 
-# 6. CMakeLists.txt
+# 6. include/sqlvdi_guids.h
+#    - Declares CLSID_MSSQL_ClientVirtualDeviceSet and IID_IClientVirtualDeviceSet2
+#      using EXTERN_C const with <guiddef.h>.
+#    - Can be included from any file that needs these GUID symbols.
+
+# 7. src/sqlvdi_guids.cpp
+#    - Defines the GUIDs via DEFINE_GUID() under #define INITGUID.
+#    - Only file in the project that ever #defines INITGUID, preventing
+#      multiple-definition linker errors.
+#    - Replaces the old sqlvdi.cpp which used brace initialization instead
+#      of the standard Windows DEFINE_GUID/INITGUID pattern.
+
+# 8. CMakeLists.txt
 #    - Sets C++17 standard.
 #    - Includes the 'include' directory.
-#    - Builds the vdi_wrapper executable from the source files.
+#    - Builds the vdi_wrapper executable from the source files:
+#        * src/main.cpp
+#        * src/vdi_client.cpp
+#        * src/backup_engine.cpp
+#        * src/backup_session.cpp
+#        * src/sink.cpp
+#        * src/sqlvdi_guids.cpp     (was sqlvdi.cpp prior to GUID refactor)
 #    - Links against ole32.lib (required for COM on Windows).
 
-# 7. Build notes
+# 9. Build notes
 #    - On Windows, the project must be built with a compiler that can locate
 #      the VDI SDK headers (vdi.h) and libraries.
 #    - On non‑Windows platforms the placeholder definitions allow the code to
 #      compile, but the VDI functionality will be a no‑op.
+
+# 10. GUID Architecture (refactored 2026-05-09)
+#     - GUIDs are declared in include/sqlvdi_guids.h (EXTERN_C const with <guiddef.h>)
+#       and defined in src/sqlvdi_guids.cpp (single #define INITGUID + DEFINE_GUID).
+#     - This avoids:
+#         * Multiple-definition linker errors (only one .cpp ever defines INITGUID)
+#         * Header pollution (consumers only see extern declarations)
+#         * Fragile brace-initialization (the old sqlvdi.cpp approach)
+#     - GUID values:
+#         CLSID_MSSQL_ClientVirtualDeviceSet = {0x40700425,0x0080,0x11d2,{0x85,0x1f,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
+#         IID_IClientVirtualDeviceSet2        = {0x40700425,0x0080,0x11d2,{0x85,0x1f,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
+
+# 11. VDI COM Registration Test
+#     - Confirmed (2026-05-09): CLSID_MSSQL_ClientVirtualDeviceSet
+#       ({40700425-0080-11d2-851f-00c04fc21759}) IS registered on this machine.
+#       CoCreateInstance returns SUCCESS.
+#     - Compilation commands (MSVC x64, run from repo root):
+#       $env:Path = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64;" + $env:Path;
+#       $env:INCLUDE = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared;C:\Users\azureuser\source\repos\rushikesh90\vdi-cpp-wrapper\include";
+#       $env:LIB = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64";
+#       cl src\sqlvdi_guids.cpp /c /EHsc /std:c++17 /Fosqlvdi_guids.obj   # GUID definition compile test
+#       cl src\vdi_client.cpp /c /EHsc /std:c++17 /Fovdi_client.obj       # Consumer compile test
+#     - Key detail: only the single definition file (sqlvdi_guids.cpp) places
+#       `#define INITGUID` BEFORE any includes; all other files consume the
+#       EXTERN_C const declarations from sqlvdi_guids.h without INITGUID.
 
 # End of .clinerules
