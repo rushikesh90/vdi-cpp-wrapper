@@ -1,5 +1,3 @@
-# .clinerules
-
 # Project: vdi_wrapper
 # Description: This file documents the high‑level code structure and the
 # responsibilities of each component in the VDI wrapper project.
@@ -72,18 +70,92 @@
 #    - On non‑Windows platforms the placeholder definitions allow the code to
 #      compile, but the VDI functionality will be a no‑op.
 
-# 10. GUID Architecture (refactored 2026-05-09)
+# 10. GUID Architecture (refactored 2026-05-09, IID corrected 2026-05-13)
 #     - GUIDs are declared in include/sqlvdi_guids.h (EXTERN_C const with <guiddef.h>)
 #       and defined in src/sqlvdi_guids.cpp (single #define INITGUID + DEFINE_GUID).
 #     - This avoids:
 #         * Multiple-definition linker errors (only one .cpp ever defines INITGUID)
 #         * Header pollution (consumers only see extern declarations)
 #         * Fragile brace-initialization (the old sqlvdi.cpp approach)
-#     - GUID values:
+#     - GUID values (CRITICAL: IID and CLSID are DIFFERENT GUIDs):
 #         CLSID_MSSQL_ClientVirtualDeviceSet = {0x40700425,0x0080,0x11d2,{0x85,0x1f,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
-#         IID_IClientVirtualDeviceSet2        = {0x40700425,0x0080,0x11d2,{0x85,0x1f,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
+#         IID_IClientVirtualDeviceSet2        = {0xd0e6eb07,0x7a62,0x11d2,{0x85,0x73,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
+#         IID_IClientVirtualDevice            = {0x40700424,0x0080,0x11d2,{0x85,0x1f,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
+#         IID_IClientVirtualDeviceSet         = {0x40700425,0x0080,0x11d2,{0x85,0x1f,0x00,0xc0,0x4f,0xc2,0x17,0x59}}
 
-# 11. VDI COM Registration Test
+# 10a. CreateEx Signature Fix (critical 2026-05-13)
+#      - WRONG: CreateEx(LPCWSTR lpName, VDConfig* pConfig) - TWO parameters
+#      - RIGHT: CreateEx(LPCWSTR lpInstanceName, LPCWSTR lpName, VDConfig* pConfig) - THREE parameters
+#      - First parameter is the SQL Server instance name (nullptr for default instance)
+#      - Calling with wrong signature causes VD_E_NOTSUPPORTED (0x80770009)
+#      - Fixed in include/sqlvdi.h and src/vdi_client.cpp
+
+# 10b. VDConfig Structure Complete Definition (critical 2026-05-13)
+#      - WRONG: Only 3 fields (deviceCount, features, commandTimeout)
+#      - RIGHT: 11 fields as per MS SQL Server VDI specification
+#      All required fields:
+#        - deviceCount: Number of virtual devices
+#        - features: Feature flags (VDF_Default = 0)
+#        - prefixZoneSize: Prefix zone size (typically 0 for basic backup)
+#        - alignment: Buffer alignment (0 = use default)
+#        - softFileMarkBlockSize: Soft file mark block size (0 = default)
+#        - EOMWarningSize: End-of-media warning threshold (0 = disabled)
+#        - serverTimeOut: Server timeout in milliseconds (60000 = 60 seconds)
+#        - blockSize: Logical block size (0 = use default)
+#        - maxIODepth: Maximum I/O queue depth (0 = unlimited)
+#        - maxTransferSize: Maximum transfer size (0 = unlimited)
+#        - bufferAreaSize: Total buffer area size (0 = use default)
+#      - Incomplete structure causes VD_E_INVALID (0x80770006)
+#      - Fixed by initializing all 11 fields to appropriate values
+#      - See Microsoft samples: github.com/microsoft/sql-server-samples/blob/master/samples/features/sqlvdi/include/vdi.h
+
+# 10c. IClientVirtualDeviceSet2 Vtable Layout Fix (CRITICAL 2026-05-13)
+#      - ROOT CAUSE of "Run-Time Check Failure: ESP not properly saved" error
+#      - WRONG: interface IClientVirtualDeviceSet2 : public IUnknown
+#        (only 3 vtable entries before CreateEx -> CreateEx at slot 3, but actual
+#         implementation expects it at slot 11)
+#      - RIGHT: interface IClientVirtualDeviceSet2 : public IClientVirtualDeviceSet
+#        (inherits 8 methods from IClientVirtualDeviceSet + QI/AddRef/Release
+#         -> CreateEx at slot 11 matches actual COM implementation)
+#      - The real VDI interface chain is:
+#        IUnknown -> IClientVirtualDeviceSet (8 methods) -> IClientVirtualDeviceSet2 (2 methods)
+#      - Wrong vtable offset causes mismatched stack cleanup -> ESP corruption -> RTC failure
+#      - Fixed in include/sqlvdi.h
+
+# 10d. VDI Protocol Flow (2026-05-13)
+#      - Proper sequence documented in src/vdi_client.cpp:
+#        1. CoCreateInstance(CLSID, IID_IClientVirtualDeviceSet2)
+#        2. device_set_->CreateEx(nullptr, lpName, &config)
+#        3. device_set_->GetConfiguration(timeout, &server_config)
+#           - BLOCKS waiting for SQL Server to connect via T-SQL:
+#             BACKUP DATABASE [db] TO VIRTUAL_DEVICE = N'<name>'
+#           - Fails with VD_E_TIMEOUT (0x80770003) after timeout if no SQL Server connects
+#        4. device_set_->OpenDevice(name, &device) - for each device
+#           - The device name must match the T-SQL VIRTUAL_DEVICE name EXACTLY
+#           - DO NOT append ":<index>" - use the base name directly
+#           - OpenDevice called before GetConfiguration fails with VD_E_OBJECT (0x8077000c)
+#           - After OpenDevice succeeds, the command loop MUST start immediately
+#        5. device->GetCommand(INFINITE, &cmd) - blocks for SQL Server commands
+#        6. Process command (VDC_Write, VDC_Flush, VDC_ClearError, etc.)
+#        7. device->CompleteCommand(cmd, status, bytes, position)
+#        8. Repeat steps 5-7 until GetCommand returns error (VD_E_CLOSE)
+#      - SQL Server IO error 995 = The I/O operation has been aborted
+#        This means VDI client dropped the connection (exited without completing
+#        commands or entering the command loop).
+
+# 11. Reference: Official Microsoft VDI Header
+#     - include/vdi_real.h is the official MIDL-generated vdi.h from Microsoft's
+#       SQL Server samples repository
+#     - Downloaded from:
+#       https://raw.githubusercontent.com/microsoft/sql-server-samples/master/samples/features/sqlvdi/include/vdi.h
+#     - Contains the complete interface definitions for all 6 VDI interfaces:
+#       IClientVirtualDevice, IClientVirtualDeviceSet, IClientVirtualDeviceSet2,
+#       IServerVirtualDevice, IServerVirtualDeviceSet, IServerVirtualDeviceSet2
+#     - Also defines CLSID_MSSQL_ClientVirtualDeviceSet as an alias for IID_IClientVirtualDeviceSet
+#     - The project's include/sqlvdi.h is a simplified version that only declares
+#       the client-side interfaces needed by this wrapper
+
+# 11a. VDI COM Registration Test
 #     - Confirmed (2026-05-09): CLSID_MSSQL_ClientVirtualDeviceSet
 #       ({40700425-0080-11d2-851f-00c04fc21759}) IS registered on this machine.
 #       CoCreateInstance returns SUCCESS.
@@ -96,5 +168,24 @@
 #     - Key detail: only the single definition file (sqlvdi_guids.cpp) places
 #       `#define INITGUID` BEFORE any includes; all other files consume the
 #       EXTERN_C const declarations from sqlvdi_guids.h without INITGUID.
+#
+# 12. CMake CLI build and clean rules
+#     - Configure the build tree from the repo root:
+#         cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+#     - Build the default target:
+#         cmake --build build --config Debug
+#     - Build release:
+#         cmake --build build --config Release
+#     - Clean the build tree:
+#         cmake --build build --target clean --config Debug
+#       or for multi-config projects:
+#         cmake --build build --target clean --config Release
+#     - Install the built executable (optional):
+#         cmake --install build --config Release
+#     - The generated binary will be placed in:
+#         build/bin/<Config>/vdi_wrapper.exe
+#       for example build/bin/Debug/vdi_wrapper.exe or build/bin/Release/vdi_wrapper.exe
+#     - For a single-config generator on non-Windows platforms,
+#       omit `--config <type>` and choose `-DCMAKE_BUILD_TYPE` at configure time.
 
 # End of .clinerules
