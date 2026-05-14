@@ -237,11 +237,14 @@ void VdiClient::process_commands() {
                 &cmd);
 
             if (FAILED(hr)) {
-                // VD_E_CLOSE (0x80770001) means SQL Server finished and
-                // closed the connection.  This is the normal way the
-                // command loop terminates in the real VDI protocol.
+                // VD_E_CLOSE (0x80770001) and VD_E_EOF (0x8077000e) mean
+                // SQL Server finished and closed the connection.  These are
+                // the normal ways the command loop terminates in the real
+                // VDI protocol.
                 if (hr == VD_E_CLOSE) {
                     std::cout << "GetCommand returned VD_E_CLOSE – backup complete.\n";
+                } else if (hr == VD_E_EOF) {
+                    std::cout << "GetCommand returned VD_E_EOF – backup complete.\n";
                 } else {
                     log_hresult("GetCommand failed", hr);
                 }

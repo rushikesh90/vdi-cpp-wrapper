@@ -66,6 +66,22 @@ enum VDCommands {
     VDC_FileInfoEnd     = 17
 };
 
+// Sentinel value - not a real VDI command code.
+// Used internally to signal that the command loop should stop.
+// The real VDI protocol signals close by returning VD_E_CLOSE from GetCommand,
+// not by delivering a command with this code.
+#define VDC_Close 99
+
+// VDI error codes (from Microsoft VDI specification)
+#define VD_E_CLOSE          0x80770001L
+#define VD_E_OPEN           0x80770002L
+#define VD_E_TIMEOUT        0x80770003L
+#define VD_E_ABORT          0x80770004L
+#define VD_E_INVALID        0x80770006L
+#define VD_E_NOTSUPPORTED   0x80770009L
+#define VD_E_OBJECT         0x8077000cL
+#define VD_E_EOF            0x8077000eL
+
 typedef struct _VDC_Command {
     DWORD commandCode;
     DWORD size;
