@@ -1,4 +1,22 @@
 #include "vdi_client.h"
+#include <iomanip>
+
+const char* command_to_string(DWORD cmd) {
+    switch (cmd) {
+    case VDC_Read:       return "VDC_Read";
+    case VDC_Write:      return "VDC_Write";
+    case VDC_Flush:      return "VDC_Flush";
+    case VDC_Close:      return "VDC_Close";
+    default:             return "UNKNOWN";
+    }
+}
+
+void log_hresult(const char* msg, HRESULT hr) {
+    std::cerr << msg
+              << " HRESULT=0x"
+              << std::hex << hr
+              << std::dec << "\n";
+}
 
 VdiClient::VdiClient() : device_set_(nullptr), current_cmd_(nullptr) {}
 
@@ -19,7 +37,7 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
 #if defined(_WIN32)
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
-        std::wcerr << L"CoInitializeEx failed: 0x" << std::hex << hr << L"\n";
+        log_hresult("CoInitializeEx failed", hr);
         return false;
     }
 
@@ -32,8 +50,7 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
     );
 
     if (FAILED(hr)) {
-        std::wcerr << L"CoCreateInstance(CLSID_MSSQL_ClientVirtualDeviceSet) failed: 0x"
-                   << std::hex << hr << L"\n";
+        log_hresult("CoCreateInstance(CLSID_MSSQL_ClientVirtualDeviceSet) failed", hr);
         return false;
     }
 
@@ -52,8 +69,7 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
 
     hr = device_set_->CreateEx(nullptr, device_name.c_str(), &config);
     if (FAILED(hr)) {
-        std::wcerr << L"CreateEx(nullptr, \"" << device_name << L"\") failed: 0x"
-                   << std::hex << hr << L"\n";
+        log_hresult("CreateEx failed", hr);
         if (hr == 0x80770009) {
             std::wcerr << L"Hint: VD_E_NOTSUPPORTED - check VDConfig or configuration parameters.\n";
         }
@@ -88,7 +104,7 @@ bool VdiClient::open_devices() {
 
     HRESULT hr = device_set_->GetConfiguration(60000, &server_config);
     if (FAILED(hr)) {
-        std::wcerr << L"GetConfiguration failed: 0x" << std::hex << hr << L"\n";
+        log_hresult("GetConfiguration failed", hr);
         std::wcerr << L"Make sure SQL Server is running and a BACKUP ... TO VIRTUAL_DEVICE command\n";
         std::wcerr << L"has been issued with device name \"" << device_name_.c_str() << L"\"\n";
         if (hr == 0x8077000c) {
@@ -117,8 +133,7 @@ bool VdiClient::open_devices() {
             &device);
 
         if (FAILED(hr)) {
-            std::wcerr << L"OpenDevice(\"" << device_name_ << L"\") failed: 0x"
-                       << std::hex << hr << L"\n";
+            log_hresult("OpenDevice failed", hr);
             return false;
         }
 
@@ -149,7 +164,7 @@ bool VdiClient::get_next_chunk(uint8_t*& data, size_t& size) {
 
     HRESULT hr = device->GetCommand(INFINITE, &cmd);
     if (FAILED(hr)) {
-        std::wcerr << L"GetCommand failed: 0x" << std::hex << hr << L"\n";
+        log_hresult("GetCommand failed", hr);
         return false;
     }
 
@@ -190,7 +205,7 @@ void VdiClient::complete_chunk() {
 
     HRESULT hr = device->CompleteCommand(cmd, ERROR_SUCCESS, cmd->size, cmd->position);
     if (FAILED(hr)) {
-        std::wcerr << L"CompleteCommand failed: 0x" << std::hex << hr << L"\n";
+        log_hresult("CompleteCommand failed", hr);
     }
 
     current_cmd_ = nullptr;
@@ -204,5 +219,102 @@ void VdiClient::close() {
 
     if (device_set_) {
         device_set_->Close();
+    }
+}
+
+void VdiClient::process_commands() {
+
+    bool running = true;
+
+    while (running) {
+
+        for (auto device : devices_) {
+
+            VDC_Command* cmd = nullptr;
+
+            HRESULT hr = device->GetCommand(
+                INFINITE,
+                &cmd);
+
+            if (FAILED(hr)) {
+                // VD_E_CLOSE (0x80770001) means SQL Server finished and
+                // closed the connection.  This is the normal way the
+                // command loop terminates in the real VDI protocol.
+                if (hr == VD_E_CLOSE) {
+                    std::cout << "GetCommand returned VD_E_CLOSE – backup complete.\n";
+                } else {
+                    log_hresult("GetCommand failed", hr);
+                }
+                running = false;
+                break;
+            }
+
+            if (!cmd) {
+                continue;
+            }
+
+            std::cout << "Received command: "
+                      << command_to_string(cmd->commandCode)
+                      << " (code=" << cmd->commandCode << ")\n";
+
+            handle_command(device, cmd);
+
+            if (cmd->commandCode == VDC_Close) {
+                running = false;
+            }
+        }
+    }
+}
+
+void VdiClient::handle_command(
+    IClientVirtualDevice* device,
+    VDC_Command* cmd) {
+
+    HRESULT hr = S_OK;
+
+    switch (cmd->commandCode) {
+
+    case VDC_Read:
+        std::cout << "  [" << command_to_string(cmd->commandCode) << "]\n";
+
+        // SQL Server requesting data read
+        // (not expected during a pure BACKUP; used for RESTORE)
+        break;
+
+    case VDC_Write:
+        std::cout << "  [" << command_to_string(cmd->commandCode) << "] size="
+                  << cmd->size << " position="
+                  << cmd->position << "\n";
+
+        // SQL Server sending backup data.
+        // Data is in cmd->buffer, size is cmd->size.
+        // In a real backup application we would write this to disk.
+        break;
+
+    case VDC_Flush:
+        std::cout << "  [" << command_to_string(cmd->commandCode) << "]\n";
+        break;
+
+    case VDC_ClearError:
+        std::cout << "  [" << command_to_string(cmd->commandCode) << "]\n";
+        break;
+
+    case VDC_Close:
+        std::cout << "  [" << command_to_string(cmd->commandCode) << "] sentinel – completing session.\n";
+        // VDC_Close (99) is our internal sentinel, not a real VDI command.
+        // Do NOT call CompleteCommand for it.  Just return immediately.
+        return;
+
+    default:
+        std::cout << "  [UNKNOWN COMMAND: " << cmd->commandCode << "]\n";
+        break;
+    }
+
+    // CompleteCommand requires 4 arguments:
+    //   (cmd, dwCompletionCode, dwBytesTransferred, dwlPosition)
+    hr = device->CompleteCommand(cmd, ERROR_SUCCESS, cmd->size, cmd->position);
+
+    if (FAILED(hr)) {
+        log_hresult("CompleteCommand failed", hr);
     }
 }
