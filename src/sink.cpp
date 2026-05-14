@@ -1,5 +1,2 @@
-#include "sink.h"
-
-void NullSink::write(const uint8_t*, size_t) {
-    // no-op
-}
+// NullSink is fully defined inline in include/sink.h.
+// This file is intentionally empty.

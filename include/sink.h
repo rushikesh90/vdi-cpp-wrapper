@@ -1,14 +1,22 @@
 #pragma once
-#include <cstddef>
+
 #include <cstdint>
+#include <cstddef>
 
 class Sink {
 public:
     virtual ~Sink() = default;
-    virtual void write(const uint8_t* data, size_t size) = 0;
+
+    virtual bool write(
+        const uint8_t* data,
+        size_t size) = 0;
+
+    virtual void flush() {}
 };
 
 class NullSink : public Sink {
 public:
-    void write(const uint8_t* data, size_t size) override;
+    bool write(const uint8_t*, size_t) override {
+        return true;
+    }
 };

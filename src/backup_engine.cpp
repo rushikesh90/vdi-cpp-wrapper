@@ -1,6 +1,6 @@
 #include "backup_engine.h"
 #include "vdi_client.h"
-#include "sink.h"
+#include "file_sink.h"
 #include <iostream>
 
 BackupEngine::BackupEngine() {}
@@ -8,7 +8,7 @@ BackupEngine::BackupEngine() {}
 void BackupEngine::start_backup(const BackupRequest& request) {
     // Phase 1: Create the VDI device set
 
-    auto client = std::make_unique<VdiClient>();
+    auto client = std::make_unique<VdiClient>(std::make_unique<FileSink>("backup_stream.bin"));
     if (!client->connect(request.device_name, request.device_count)) {
         return;
     }
@@ -30,14 +30,7 @@ void BackupEngine::start_backup(const BackupRequest& request) {
 
     std::cout << "VDI device open and ready. Data transfer starting...\n";
 
-    auto sink = std::make_unique<NullSink>();
-
-    session_ = std::make_unique<BackupSession>(
-        std::move(client),
-        std::move(sink)
-    );
-
-    session_->run();
+    client->process_commands();
 
     std::cout << "Backup session completed. Press Enter to exit.\n";
     std::cin.get();

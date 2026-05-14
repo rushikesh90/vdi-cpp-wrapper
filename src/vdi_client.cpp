@@ -18,7 +18,22 @@ void log_hresult(const char* msg, HRESULT hr) {
               << std::dec << "\n";
 }
 
-VdiClient::VdiClient() : device_set_(nullptr), current_cmd_(nullptr) {}
+VdiClient::VdiClient(std::unique_ptr<Sink> sink)
+    : device_set_(nullptr),
+      current_cmd_(nullptr),
+      sink_(std::move(sink)),
+      total_bytes_(0) {
+
+#if defined(_WIN32)
+    HRESULT hr = CoInitializeEx(
+        NULL,
+        COINIT_MULTITHREADED);
+
+    if (FAILED(hr)) {
+        std::cerr << "COM init failed\n";
+    }
+#endif
+}
 
 VdiClient::~VdiClient() {
 #if defined(_WIN32)
@@ -35,13 +50,7 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
     device_count_ = device_count;
 
 #if defined(_WIN32)
-    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr)) {
-        log_hresult("CoInitializeEx failed", hr);
-        return false;
-    }
-
-    hr = CoCreateInstance(
+    HRESULT hr = CoCreateInstance(
         CLSID_MSSQL_ClientVirtualDeviceSet,
         NULL,
         CLSCTX_INPROC_SERVER,
@@ -285,17 +294,32 @@ void VdiClient::handle_command(
         break;
 
     case VDC_Write:
-        std::cout << "  [" << command_to_string(cmd->commandCode) << "] size="
-                  << cmd->size << " position="
-                  << cmd->position << "\n";
+    {
+        size_t size = cmd->size;
 
-        // SQL Server sending backup data.
-        // Data is in cmd->buffer, size is cmd->size.
-        // In a real backup application we would write this to disk.
+        total_bytes_ += size;
+
+        std::cout << "  [VDC_Write]"
+                  << " size=" << size
+                  << " total=" << total_bytes_
+                  << "\n";
+
+        if (sink_) {
+            sink_->write(
+                static_cast<uint8_t*>(cmd->buffer),
+                size);
+        }
+
         break;
+    }
 
     case VDC_Flush:
-        std::cout << "  [" << command_to_string(cmd->commandCode) << "]\n";
+        std::cout << "  [VDC_Flush]\n";
+
+        if (sink_) {
+            sink_->flush();
+        }
+
         break;
 
     case VDC_ClearError:
@@ -303,9 +327,13 @@ void VdiClient::handle_command(
         break;
 
     case VDC_Close:
-        std::cout << "  [" << command_to_string(cmd->commandCode) << "] sentinel – completing session.\n";
-        // VDC_Close (99) is our internal sentinel, not a real VDI command.
-        // Do NOT call CompleteCommand for it.  Just return immediately.
+        std::cout << "  [VDC_Close]\n";
+
+        std::cout << "Backup completed\n";
+        std::cout << "Total bytes: "
+                  << total_bytes_
+                  << "\n";
+
         return;
 
     default:

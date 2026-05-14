@@ -14,6 +14,7 @@ add_executable(vdi_wrapper
     src/vdi_client.cpp
     src/backup_engine.cpp
     src/backup_session.cpp
+    src/file_sink.cpp
     src/sink.cpp
     src/sqlvdi_guids.cpp
 )

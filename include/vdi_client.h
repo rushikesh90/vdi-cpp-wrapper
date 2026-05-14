@@ -18,13 +18,16 @@ inline HRESULT CoCreateInstance(const void*, void*, unsigned int, const void*, v
 #endif
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <iostream>
 
+#include "sink.h"
+
 class VdiClient {
 public:
-    VdiClient();
+    VdiClient(std::unique_ptr<Sink> sink);
     ~VdiClient();
 
     bool connect(const std::wstring& device_name, int device_count);
@@ -33,10 +36,19 @@ public:
     void complete_chunk();
     void close();
 
+    // Command processing loop
+    void process_commands();
+
 private:
+    void handle_command(IClientVirtualDevice* device,
+                        VDC_Command* cmd);
+
     IClientVirtualDeviceSet2* device_set_;
     void* current_cmd_;
-    
+
+    std::unique_ptr<Sink> sink_;
+    uint64_t total_bytes_;
+
     std::vector<IClientVirtualDevice*> devices_;
     std::wstring device_name_;
     int device_count_;
