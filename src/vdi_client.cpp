@@ -1,4 +1,5 @@
 #include "vdi_client.h"
+#include <chrono>
 #include <iomanip>
 
 const char* command_to_string(DWORD cmd) {
@@ -233,6 +234,8 @@ void VdiClient::close() {
 
 void VdiClient::process_commands() {
 
+    auto start = std::chrono::steady_clock::now();
+
     bool running = true;
 
     while (running) {
@@ -249,7 +252,8 @@ void VdiClient::process_commands() {
                 // VD_E_CLOSE (0x80770001) and VD_E_EOF (0x8077000e) mean
                 // SQL Server finished and closed the connection.  These are
                 // the normal ways the command loop terminates in the real
-                // VDI protocol.
+                // VDI protocol.  At this point cmd is NULL – do NOT pass
+                // it to handle_command.
                 if (hr == VD_E_CLOSE) {
                     std::cout << "GetCommand returned VD_E_CLOSE – backup complete.\n";
                 } else if (hr == VD_E_EOF) {
@@ -276,6 +280,23 @@ void VdiClient::process_commands() {
             }
         }
     }
+
+    // --- Compute and display throughput ---
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    double seconds = elapsed.count();
+
+    std::cout << "\n=== Backup Complete ===\n";
+    std::cout << "Total bytes: " << total_bytes_ << "\n";
+    std::cout << "Elapsed time: " << seconds << " s\n";
+
+    if (seconds > 0.0) {
+        double mbps = (static_cast<double>(total_bytes_) / 1024.0 / 1024.0) / seconds;
+        std::cout << "Throughput:   " << mbps << " MB/s\n";
+    } else {
+        std::cout << "Throughput:   N/A (no time elapsed)\n";
+    }
+    std::cout << "=======================\n";
 }
 
 void VdiClient::handle_command(
@@ -328,12 +349,6 @@ void VdiClient::handle_command(
 
     case VDC_Close:
         std::cout << "  [VDC_Close]\n";
-
-        std::cout << "Backup completed\n";
-        std::cout << "Total bytes: "
-                  << total_bytes_
-                  << "\n";
-
         return;
 
     default:

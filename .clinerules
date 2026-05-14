@@ -4,12 +4,19 @@
 
 # 1. include/vdi_client.h
 #    - Provides the VdiClient class interface.
-#    - On Windows builds includes <windows.h>, <vdi.h>, and <combaseapi.h>.
+#    - On Windows builds includes <windows.h>, <sqlvdi.h>, and <combaseapi.h>.
 #    - Defines a placeholder implementation for non‑Windows platforms to allow
 #      compilation without the actual VDI SDK.
 #    - Exposes:
 #        * IClientVirtualDeviceSet2* device_set_;
 #        * bool connect(const std::wstring&, int);
+#        * bool open_devices();
+#        * bool get_next_chunk(uint8_t*&, size_t&);
+#        * void complete_chunk();
+#        * void close();
+#        * void process_commands();        // Main command loop (added 2026-05-14)
+#    - Private:
+#        * void handle_command(IClientVirtualDevice*, VDC_Command*);
 #        * Destructor releases COM object and calls CoUninitialize() on Windows.
 
 # 2. src/vdi_client.cpp
@@ -21,6 +28,17 @@
 #        * Returns true on success.
 #    - Non‑Windows path:
 #        * Returns true as a stub.
+#    - process_commands() (added 2026-05-14):
+#        * Loops over all open devices calling GetCommand(INFINITE, &cmd).
+#        * Processes each command via handle_command().
+#        * Terminates on VD_E_CLOSE from GetCommand (the real VDI close signal)
+#          OR on VDC_Close sentinel command code.
+#    - handle_command() (added 2026-05-14):
+#        * Switch on cmd->commandCode for VDC_Read, VDC_Write, VDC_Flush,
+#          VDC_ClearError, VDC_Close.
+#        * Calls CompleteCommand with 4 args: (cmd, ERROR_SUCCESS, size, position).
+#          CRITICAL: CompleteCommand takes 4 parameters (not 2 as in some pseudocode).
+#          Wrong signature causes compile error or stack corruption.
 
 # 3. include/backup_request.h
 #    - Defines BackupRequest struct with database name, backup type,
@@ -37,8 +55,12 @@
 
 # 5. src/main.cpp
 #    - Entry point for the application.
-#    - Constructs a BackupRequest, sets database and type.
-#    - Instantiates BackupEngine and starts the backup.
+#    - Currently uses VdiClient directly (2026-05-14 refactor):
+#        * Generates a unique VDI device name with process ID suffix.
+#        * Calls client.connect() then client.open_devices().
+#        * Prints instructions for the T-SQL BACKUP command the user must run.
+#        * Calls client.process_commands() to handle the backup data flow.
+#    - Previously used BackupEngine/BackupRequest (see backup_engine.cpp for that path).
 
 # 6. include/sqlvdi_guids.h
 #    - Declares CLSID_MSSQL_ClientVirtualDeviceSet and IID_IClientVirtualDeviceSet2
@@ -69,6 +91,8 @@
 #      the VDI SDK headers (vdi.h) and libraries.
 #    - On non‑Windows platforms the placeholder definitions allow the code to
 #      compile, but the VDI functionality will be a no‑op.
+#    - CMake build is currently non-functional on this machine (2026-05-14).
+#      Use manual MSVC cl.exe commands (see section 11a) instead.
 
 # 10. GUID Architecture (refactored 2026-05-09, IID corrected 2026-05-13)
 #     - GUIDs are declared in include/sqlvdi_guids.h (EXTERN_C const with <guiddef.h>)
@@ -137,11 +161,45 @@
 #           - After OpenDevice succeeds, the command loop MUST start immediately
 #        5. device->GetCommand(INFINITE, &cmd) - blocks for SQL Server commands
 #        6. Process command (VDC_Write, VDC_Flush, VDC_ClearError, etc.)
-#        7. device->CompleteCommand(cmd, status, bytes, position)
-#        8. Repeat steps 5-7 until GetCommand returns error (VD_E_CLOSE)
+#        7. device->CompleteCommand(cmd, status, bytes, position) -- MUST be 4 args!
+#        8. Repeat steps 5-7 until GetCommand returns VD_E_CLOSE (0x80770001).
 #      - SQL Server IO error 995 = The I/O operation has been aborted
 #        This means VDI client dropped the connection (exited without completing
 #        commands or entering the command loop).
+
+# 10e. Command Loop Architecture (added 2026-05-14)
+      - VdiClient::process_commands() implements the main command loop.
+      - VdiClient::handle_command() dispatches each command.
+      - Close detection uses TWO mechanisms (belt-and-suspenders):
+        1. GetCommand returning FAILED(hr) with hr == VD_E_CLOSE (0x80770001).
+           This is the REAL close signal in the VDI protocol.
+        2. VDC_Close sentinel (99) command code for internal signaling.
+      - CRITICAL: CompleteCommand takes 4 parameters:
+          (cmd, dwCompletionCode, dwBytesTransferred, dwlPosition)
+        NOT 2 parameters as sometimes shown in pseudocode.
+        Wrong signature won't compile (or causes stack corruption if it does).
+      - VDI error codes defined in include/sqlvdi.h:
+        VD_E_CLOSE        = 0x80770001 (normal session end)
+        VD_E_TIMEOUT      = 0x80770003 (no SQL Server connection)
+        VD_E_OBJECT       = 0x8077000c (wrong order of operations)
+        VD_E_NOTSUPPORTED = 0x80770009 (bad parameters)
+        VD_E_INVALID      = 0x80770006 (bad VDConfig)
+        VD_E_ABORT        = 0x80770004 (aborted)
+        VD_E_OPEN         = 0x80770002 (open failed)
+
+# 10f. Throughput Instrumentation (added 2026-05-14)
+      - process_commands() records std::chrono::steady_clock::now() start
+        before entering the command loop.
+      - After the loop exits (via VD_E_CLOSE, VD_E_EOF, or VDC_Close command
+        code), the elapsed wall-clock time is computed.
+      - Throughput is printed as:
+          Throughput:   X.XXXXX MB/s
+        where MB/s = (total_bytes_ / 1024.0 / 1024.0) / seconds.
+      - This works for ALL close paths – not just the VDC_Close command code.
+      - See vdi_client.cpp process_commands().
+      - CRITICAL: In the VD_E_CLOSE / VD_E_EOF branch, cmd is NULL so we must
+        NOT call handle_command(device, cmd) – doing so would dereference NULL.
+        Instead we simply log the message and break out of the loop.
 
 # 11. Reference: Official Microsoft VDI Header
 #     - include/vdi_real.h is the official MIDL-generated vdi.h from Microsoft's
@@ -165,6 +223,8 @@
 #       $env:LIB = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64";
 #       cl src\sqlvdi_guids.cpp /c /EHsc /std:c++17 /Fosqlvdi_guids.obj   # GUID definition compile test
 #       cl src\vdi_client.cpp /c /EHsc /std:c++17 /Fovdi_client.obj       # Consumer compile test
+#       cl src\main.cpp /c /EHsc /std:c++17 /Fomain.obj                   # Main compile
+#       link main.obj vdi_client.obj sqlvdi_guids.obj /OUT:vdi_wrapper.exe ole32.lib /SUBSYSTEM:CONSOLE
 #     - Key detail: only the single definition file (sqlvdi_guids.cpp) places
 #       `#define INITGUID` BEFORE any includes; all other files consume the
 #       EXTERN_C const declarations from sqlvdi_guids.h without INITGUID.
