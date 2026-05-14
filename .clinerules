@@ -33,12 +33,19 @@
 #        * Processes each command via handle_command().
 #        * Terminates on VD_E_CLOSE from GetCommand (the real VDI close signal)
 #          OR on VDC_Close sentinel command code.
+#        * After loop exits calls metrics_.print_summary() for aggregated stats.
 #    - handle_command() (added 2026-05-14):
 #        * Switch on cmd->commandCode for VDC_Read, VDC_Write, VDC_Flush,
 #          VDC_ClearError, VDC_Close.
+#        * VDC_Write now delegates to process_write() (added 2026-05-14).
 #        * Calls CompleteCommand with 4 args: (cmd, ERROR_SUCCESS, size, position).
 #          CRITICAL: CompleteCommand takes 4 parameters (not 2 as in some pseudocode).
 #          Wrong signature causes compile error or stack corruption.
+#    - process_write() (added 2026-05-14):
+#        * Dedicated handler for VDC_Write commands.
+#        * Records start time, calls metrics_.add_bytes(), writes data to sink,
+#          then records chunk latency via metrics_.record_chunk_latency().
+#        * Prints "[WRITE] size=<N>" debug log.
 
 # 3. include/backup_request.h
 #    - Defines BackupRequest struct with database name, backup type,
@@ -83,6 +90,8 @@
 #        * src/backup_engine.cpp
 #        * src/backup_session.cpp
 #        * src/sink.cpp
+#        * src/metrics.cpp          (added 2026-05-14)
+#        * src/buffer_pool.cpp      (added 2026-05-14)
 #        * src/sqlvdi_guids.cpp     (was sqlvdi.cpp prior to GUID refactor)
 #    - Links against ole32.lib (required for COM on Windows).
 
@@ -187,16 +196,15 @@
         VD_E_ABORT        = 0x80770004 (aborted)
         VD_E_OPEN         = 0x80770002 (open failed)
 
-# 10f. Throughput Instrumentation (added 2026-05-14)
+# 10f. Throughput Instrumentation (refactored 2026-05-14)
       - process_commands() records std::chrono::steady_clock::now() start
         before entering the command loop.
-      - After the loop exits (via VD_E_CLOSE, VD_E_EOF, or VDC_Close command
-        code), the elapsed wall-clock time is computed.
-      - Throughput is printed as:
-          Throughput:   X.XXXXX MB/s
-        where MB/s = (total_bytes_ / 1024.0 / 1024.0) / seconds.
+      - After the loop exits, calls metrics_.print_summary() which:
+        * Computes elapsed wall-clock time.
+        * Calculates throughput in MB/s = (total_bytes / 1024^2) / seconds.
+        * Prints bytes, chunk count, and throughput.
       - This works for ALL close paths – not just the VDC_Close command code.
-      - See vdi_client.cpp process_commands().
+      - See vdi_client.cpp process_commands() and src/metrics.cpp.
       - CRITICAL: In the VD_E_CLOSE / VD_E_EOF branch, cmd is NULL so we must
         NOT call handle_command(device, cmd) – doing so would dereference NULL.
         Instead we simply log the message and break out of the loop.
@@ -248,4 +256,28 @@
 #     - For a single-config generator on non-Windows platforms,
 #       omit `--config <type>` and choose `-DCMAKE_BUILD_TYPE` at configure time.
 
+# 13. include/metrics.h / src/metrics.cpp (added 2026-05-14)
+#     - Metrics class tracks backup statistics:
+#       * total_bytes_ (atomic uint64_t): running byte total
+#       * chunk_count_ (atomic uint64_t): number of write chunks processed
+#       * start_time_ (steady_clock::time_point): time of construction
+#     - Public API:
+#       * add_bytes(size): atomically adds bytes and increments chunk count
+#       * record_chunk_latency(us): placeholder for P99 latency tracking
+#       * print_summary(): computes and prints throughput, bytes, chunks
+#     - Used by VdiClient::process_write() for per-chunk instrumentation.
+#     - Throughput is computed as: total_bytes / 1024^2 / elapsed_seconds
+#
+# 14. include/buffer_pool.h / src/buffer_pool.cpp (added 2026-05-14)
+#     - BufferPool class manages a pre-allocated pool of fixed-size buffers.
+#     - Constructor: allocates 'count' buffers each of 'buffer_size' bytes.
+#     - Public API:
+#       * acquire(): returns a buffer pointer from the free queue (or nullptr)
+#       * release(ptr): returns a buffer pointer back to the free queue
+#     - Thread-safe via std::mutex guard on acquire() and release().
+#     - Configuration constants (include/vdi_client.h):
+#       * BUFFER_POOL_SIZE = 64  (number of buffers)
+#       * BUFFER_SIZE      = 64 * 1024  (64 KB per buffer)
+#     - BufferPool member declared in VdiClient with inline initialization.
+#
 # End of .clinerules

@@ -22,8 +22,7 @@ void log_hresult(const char* msg, HRESULT hr) {
 VdiClient::VdiClient(std::unique_ptr<Sink> sink)
     : device_set_(nullptr),
       current_cmd_(nullptr),
-      sink_(std::move(sink)),
-      total_bytes_(0) {
+      sink_(std::move(sink)) {
 
 #if defined(_WIN32)
     HRESULT hr = CoInitializeEx(
@@ -281,22 +280,7 @@ void VdiClient::process_commands() {
         }
     }
 
-    // --- Compute and display throughput ---
-    auto end = std::chrono::steady_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    double seconds = elapsed.count();
-
-    std::cout << "\n=== Backup Complete ===\n";
-    std::cout << "Total bytes: " << total_bytes_ << "\n";
-    std::cout << "Elapsed time: " << seconds << " s\n";
-
-    if (seconds > 0.0) {
-        double mbps = (static_cast<double>(total_bytes_) / 1024.0 / 1024.0) / seconds;
-        std::cout << "Throughput:   " << mbps << " MB/s\n";
-    } else {
-        std::cout << "Throughput:   N/A (no time elapsed)\n";
-    }
-    std::cout << "=======================\n";
+    metrics_.print_summary();
 }
 
 void VdiClient::handle_command(
@@ -315,24 +299,8 @@ void VdiClient::handle_command(
         break;
 
     case VDC_Write:
-    {
-        size_t size = cmd->size;
-
-        total_bytes_ += size;
-
-        std::cout << "  [VDC_Write]"
-                  << " size=" << size
-                  << " total=" << total_bytes_
-                  << "\n";
-
-        if (sink_) {
-            sink_->write(
-                static_cast<uint8_t*>(cmd->buffer),
-                size);
-        }
-
+        process_write(cmd);
         break;
-    }
 
     case VDC_Flush:
         std::cout << "  [VDC_Flush]\n";
@@ -363,4 +331,36 @@ void VdiClient::handle_command(
     if (FAILED(hr)) {
         log_hresult("CompleteCommand failed", hr);
     }
+}
+
+void VdiClient::process_write(
+    VDC_Command* writeCmd) {
+
+    auto start =
+        std::chrono::steady_clock::now();
+
+    auto* buffer =
+        static_cast<uint8_t*>(
+            writeCmd->buffer);
+
+    size_t size =
+        writeCmd->size;
+
+    metrics_.add_bytes(size);
+
+    std::cout << "[WRITE]"
+              << " size=" << size
+              << "\n";
+
+    if (sink_) {
+        sink_->write(buffer, size);
+    }
+
+    auto end =
+        std::chrono::steady_clock::now();
+
+    metrics_.record_chunk_latency(
+        std::chrono::duration_cast<
+            std::chrono::microseconds>(
+                end - start));
 }

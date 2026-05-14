@@ -22,8 +22,15 @@ inline HRESULT CoCreateInstance(const void*, void*, unsigned int, const void*, v
 #include <string>
 #include <vector>
 #include <iostream>
+#include <chrono>
 
 #include "sink.h"
+#include "metrics.h"
+#include "buffer_pool.h"
+
+// Configuration constants
+constexpr size_t BUFFER_POOL_SIZE = 64;
+constexpr size_t BUFFER_SIZE = 64 * 1024;
 
 class VdiClient {
 public:
@@ -43,11 +50,15 @@ private:
     void handle_command(IClientVirtualDevice* device,
                         VDC_Command* cmd);
 
+    void process_write(
+        VDC_Command* writeCmd);
+
     IClientVirtualDeviceSet2* device_set_;
     void* current_cmd_;
 
     std::unique_ptr<Sink> sink_;
-    uint64_t total_bytes_;
+    Metrics metrics_;
+    BufferPool buffer_pool_{BUFFER_SIZE, BUFFER_POOL_SIZE};
 
     std::vector<IClientVirtualDevice*> devices_;
     std::wstring device_name_;
