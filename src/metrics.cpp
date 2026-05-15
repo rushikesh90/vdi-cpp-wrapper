@@ -4,6 +4,10 @@
 #include <iostream>
 #include <iomanip>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 Metrics::Metrics()
     : total_bytes_(0),
       chunk_count_(0),
@@ -53,6 +57,15 @@ uint64_t Metrics::percentile(
     return sorted[idx];
 }
 
+// Helper: convert FILETIME to 64-bit microseconds
+static uint64_t filetime_to_us(const FILETIME& ft) {
+    ULARGE_INTEGER ui;
+    ui.LowPart = ft.dwLowDateTime;
+    ui.HighPart = ft.dwHighDateTime;
+    // FILETIME is in 100-ns intervals; divide by 10 → microseconds
+    return ui.QuadPart / 10;
+}
+
 void Metrics::print_summary() const {
 
     auto end =
@@ -75,6 +88,45 @@ void Metrics::print_summary() const {
 
     std::cout << "Chunks: "
               << chunk_count_ << "\n";
+
+    // Average chunk size
+    if (chunk_count_ > 0) {
+        uint64_t avg = total_bytes_ / chunk_count_;
+        std::cout << "\nAverage chunk size: "
+                  << avg << " bytes ("
+                  << std::fixed << std::setprecision(1)
+                  << (static_cast<double>(avg) / 1024.0)
+                  << " KB)\n";
+    }
+
+    // Total elapsed time
+    std::cout << "\nTotal elapsed time: "
+              << std::fixed << std::setprecision(1)
+              << seconds << " s\n";
+
+    // CPU utilization (Windows only)
+#ifdef _WIN32
+    {
+        FILETIME creation_time, exit_time, kernel_time, user_time;
+        if (GetProcessTimes(GetCurrentProcess(),
+                            &creation_time, &exit_time,
+                            &kernel_time, &user_time)) {
+            uint64_t kernel_us = filetime_to_us(kernel_time);
+            uint64_t user_us   = filetime_to_us(user_time);
+            uint64_t total_cpu_us = kernel_us + user_us;
+            double wall_us = seconds * 1'000'000.0;
+            double cpu_pct = (wall_us > 0.0)
+                ? (static_cast<double>(total_cpu_us) / wall_us) * 100.0
+                : 0.0;
+            std::cout << "CPU utilization: "
+                      << std::fixed << std::setprecision(1)
+                      << cpu_pct << "%"
+                      << " (kernel=" << (kernel_us / 1000)
+                      << " ms, user=" << (user_us / 1000)
+                      << " ms)\n";
+        }
+    }
+#endif
 
     std::cout << "\nThroughput MB/s: "
               << std::fixed << std::setprecision(1)

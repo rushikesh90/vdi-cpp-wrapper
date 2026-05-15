@@ -65,16 +65,16 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
 
     VDConfig config = {};
     config.deviceCount = device_count;
-    config.features = VDF_LikePipe;
+    config.features = VDF_Default;
     config.prefixZoneSize = 0;
     config.alignment = 0;
     config.softFileMarkBlockSize = 0;
     config.EOMWarningSize = 0;
     config.serverTimeOut = 60000;
-    config.blockSize = 0;
+    config.blockSize = 64 * 1024;
     config.maxIODepth = 0;
-    config.maxTransferSize = 0;
-    config.bufferAreaSize = 0;
+    config.bufferAreaSize = 4 * 1024 * 1024;    
+    config.maxTransferSize = 1024 * 1024;
 
     hr = device_set_->CreateEx(nullptr, device_name.c_str(), &config);
     if (FAILED(hr)) {
@@ -281,9 +281,9 @@ void VdiClient::process_commands() {
                 continue;
             }
 
-            std::cout << "Received command: "
+            /*std::cout << "Received command: "
                       << command_to_string(cmd->commandCode)
-                      << " (code=" << cmd->commandCode << ")\n";
+                      << " (code=" << cmd->commandCode << ")\n";*/
 
             handle_command(device, cmd);
 
@@ -361,9 +361,9 @@ void VdiClient::process_write(
 
     metrics_.add_bytes(size);
 
-    std::cout << "[WRITE]"
+    /*std::cout << "[WRITE]"
               << " size=" << size
-              << "\n";
+              << "\n";*/
 
     if (sink_) {
         sink_->write(buffer, size);

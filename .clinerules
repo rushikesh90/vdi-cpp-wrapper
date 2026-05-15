@@ -288,4 +288,28 @@
 #       * BUFFER_SIZE      = 64 * 1024  (64 KB per buffer)
 #     - BufferPool member declared in VdiClient with inline initialization.
 #
+# 15. include/file_sink.h / src/file_sink.cpp (rewritten 2026-05-15)
+#     - FileSink replaces std::ofstream with Win32 WriteFile + large buffered writes.
+#     - Uses HANDLE file_handle_ (CreateFileW) instead of std::ofstream.
+#     - Pre-allocated write_buffer_ of WRITE_BUFFER_SIZE (1 MB) via _aligned_malloc(4096).
+#     - Write buffering:
+#         * memcpy chunks into buffer until full, then flush_buffer() calls WriteFile.
+#         * Single writes >= WRITE_BUFFER_SIZE bypass the buffer and go directly to WriteFile.
+#     - flush() drains buffer + calls FlushFileBuffers for durability.
+#     - Destructor flushes buffer, closes handle, frees aligned buffer (RAII).
+#     - CreateFileW flags: FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN.
+#     - Benefits over std::ofstream:
+#         * No CRT locking or per-chunk syscall overhead.
+#         * Batch coalescing: multiple small VDI chunks become one 1 MB WriteFile.
+#         * Aligned allocation reduces filesystem jitter.
+#         * Sequential scan hint optimizes OS cache behavior.
+#
+# 16. Metrics Enhancements (added 2026-05-15, extended 2026-05-15)
+#     - Metrics::print_summary() prints:
+#       * average chunk size: total_bytes_ / chunk_count_ in bytes and KB.
+#       * total elapsed time: wall-clock seconds from construction to print_summary().
+#       * CPU utilization: kernel + user CPU time as percentage of wall-clock time,
+#         with breakdown in milliseconds (Win32 GetProcessTimes).
+#       * throughput in MB/s, and P50/P95/P99 latencies for GetCommand + chunk processing.
+#
 # End of .clinerules

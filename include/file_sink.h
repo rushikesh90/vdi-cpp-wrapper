@@ -1,12 +1,13 @@
 #pragma once
 
 #include "sink.h"
-#include <fstream>
+#include <windows.h>
 #include <string>
 
 class FileSink : public Sink {
 public:
     explicit FileSink(const std::string& path);
+    ~FileSink() override;
 
     bool write(
         const uint8_t* data,
@@ -15,5 +16,10 @@ public:
     void flush() override;
 
 private:
-    std::ofstream out_;
+    void flush_buffer();
+
+    HANDLE file_handle_;
+    uint8_t* write_buffer_;
+    static constexpr size_t WRITE_BUFFER_SIZE = 1 * 1024 * 1024; // 1 MB
+    size_t buffered_bytes_;
 };
