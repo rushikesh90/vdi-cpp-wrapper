@@ -243,9 +243,15 @@ void VdiClient::process_commands() {
 
             VDC_Command* cmd = nullptr;
 
+            auto cmd_start =
+                std::chrono::steady_clock::now();
+
             HRESULT hr = device->GetCommand(
                 INFINITE,
                 &cmd);
+
+            auto cmd_end =
+                std::chrono::steady_clock::now();
 
             if (FAILED(hr)) {
                 // VD_E_CLOSE (0x80770001) and VD_E_EOF (0x8077000e) mean
@@ -262,6 +268,13 @@ void VdiClient::process_commands() {
                 }
                 running = false;
                 break;
+            }
+
+            if (SUCCEEDED(hr)) {
+                metrics_.record_getcommand_latency(
+                    std::chrono::duration_cast<
+                        std::chrono::microseconds>(
+                            cmd_end - cmd_start));
             }
 
             if (!cmd) {

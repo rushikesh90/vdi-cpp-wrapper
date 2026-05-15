@@ -256,17 +256,25 @@
 #     - For a single-config generator on non-Windows platforms,
 #       omit `--config <type>` and choose `-DCMAKE_BUILD_TYPE` at configure time.
 
-# 13. include/metrics.h / src/metrics.cpp (added 2026-05-14)
+# 13. include/metrics.h / src/metrics.cpp (added 2026-05-14, enhanced 2026-05-15)
 #     - Metrics class tracks backup statistics:
 #       * total_bytes_ (atomic uint64_t): running byte total
 #       * chunk_count_ (atomic uint64_t): number of write chunks processed
 #       * start_time_ (steady_clock::time_point): time of construction
+#       * getcommand_latencies_ (vector<uint64_t>): GetCommand call durations in us
+#       * chunk_latencies_ (vector<uint64_t>): per-chunk processing durations in us
 #     - Public API:
 #       * add_bytes(size): atomically adds bytes and increments chunk count
-#       * record_chunk_latency(us): placeholder for P99 latency tracking
-#       * print_summary(): computes and prints throughput, bytes, chunks
+#       * record_chunk_latency(us): stores chunk processing timing
+#       * record_getcommand_latency(us): stores GetCommand timing
+#       * percentile(values, p): static helper returning nearest-rank percentile
+#       * print_summary(): computes and prints throughput, bytes, chunks, and
+#         P50/P95/P99 latencies for both GetCommand and chunk processing
 #     - Used by VdiClient::process_write() for per-chunk instrumentation.
+#     - GetCommand timing instrumented in VdiClient::process_commands().
 #     - Throughput is computed as: total_bytes / 1024^2 / elapsed_seconds
+#     - Latency samples collected in-memory (std::vector), sorted at print time.
+#       Currently single-threaded; a mutex would be needed if called from multiple threads.
 #
 # 14. include/buffer_pool.h / src/buffer_pool.cpp (added 2026-05-14)
 #     - BufferPool class manages a pre-allocated pool of fixed-size buffers.
