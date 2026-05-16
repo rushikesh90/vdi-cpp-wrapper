@@ -9,3 +9,7 @@ build/
 .DS_Store
 backup_stream.bin
 out/
+__pycache__/
+*.pyc
+benchmarks/python-3.13.3-embed-amd64/
+benchmarks/python-3.13.3-embed-amd64.zip
