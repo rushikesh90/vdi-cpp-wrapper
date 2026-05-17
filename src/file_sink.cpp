@@ -80,6 +80,10 @@ bool FileSink::write(
     return true;
 }
 
+bool FileSink::is_open() const {
+    return file_handle_ != INVALID_HANDLE_VALUE;
+}
+
 void FileSink::flush() {
     flush_buffer();
     if (file_handle_ != INVALID_HANDLE_VALUE) {

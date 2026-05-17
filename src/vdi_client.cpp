@@ -1,4 +1,5 @@
 #include "vdi_client.h"
+#include "logging.h"
 #include <chrono>
 #include <iomanip>
 
@@ -12,17 +13,22 @@ const char* command_to_string(DWORD cmd) {
     }
 }
 
-void log_hresult(const char* msg, HRESULT hr) {
-    std::cerr << msg
-              << " HRESULT=0x"
-              << std::hex << hr
-              << std::dec << "\n";
-}
-
-VdiClient::VdiClient(std::unique_ptr<Sink> sink)
+VdiClient::VdiClient(std::unique_ptr<Sink> sink,
+                     bool enable_logging,
+                     TimerMode timer_mode)
     : device_set_(nullptr),
       current_cmd_(nullptr),
-      sink_(std::move(sink)) {
+      sink_(std::move(sink)),
+      metrics_(std::unique_ptr<Timer>(create_timer(timer_mode)), enable_logging),
+      logging_enabled_(enable_logging),
+      state_(SessionState::INIT),
+      devices_closed_(false),
+      command_timeout_ms_(DEFAULT_COMMAND_TIMEOUT_MS),
+      last_command_us_(0),
+      last_bytes_total_(0),
+      last_stall_warn_us_(0),
+      active_buffers_(0),
+      max_active_buffers_(0) {
 
 #if defined(_WIN32)
     HRESULT hr = CoInitializeEx(
@@ -30,22 +36,38 @@ VdiClient::VdiClient(std::unique_ptr<Sink> sink)
         COINIT_MULTITHREADED);
 
     if (FAILED(hr)) {
-        std::cerr << "COM init failed\n";
+        LOG_ERROR("COM init failed: %s",
+                   hresult_to_string(hr).c_str());
+        state_ = SessionState::FAILED;
     }
 #endif
 }
 
 VdiClient::~VdiClient() {
-#if defined(_WIN32)
-    if (device_set_) {
-        device_set_->Release();
-        device_set_ = nullptr;
+    // Ensure cleanup happens even if close() was never called explicitly
+    if (state_ != SessionState::CLOSED && state_ != SessionState::INIT) {
+        LOG_WARN("VDI session destroyed without explicit close() call");
+        close();
     }
+
+#if defined(_WIN32)
     CoUninitialize();
 #endif
 }
 
+void VdiClient::set_command_timeout(unsigned long timeout_ms) {
+    command_timeout_ms_ = timeout_ms;
+    LOG_INFO("GetCommand timeout set to %lu ms", timeout_ms);
+}
+
 bool VdiClient::connect(const std::wstring& device_name, int device_count) {
+    // ── State guard: only INIT → CONNECTED ──────────────────────────────
+    if (state_ != SessionState::INIT) {
+        LOG_ERROR("connect() called in state %s (expected INIT)",
+                   session_state_to_string(state_));
+        return false;
+    }
+
     device_name_ = device_name;
     device_count_ = device_count;
 
@@ -59,7 +81,9 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
     );
 
     if (FAILED(hr)) {
-        log_hresult("CoCreateInstance(CLSID_MSSQL_ClientVirtualDeviceSet) failed", hr);
+        LOG_ERROR("CoCreateInstance failed: %s",
+                   hresult_to_string(hr).c_str());
+        state_ = SessionState::FAILED;
         return false;
     }
 
@@ -73,66 +97,68 @@ bool VdiClient::connect(const std::wstring& device_name, int device_count) {
     config.serverTimeOut = 60000;
     config.blockSize = 64 * 1024;
     config.maxIODepth = 0;
-    config.bufferAreaSize = 4 * 1024 * 1024;    
+    config.bufferAreaSize = 4 * 1024 * 1024;
     config.maxTransferSize = 1024 * 1024;
 
     hr = device_set_->CreateEx(nullptr, device_name.c_str(), &config);
     if (FAILED(hr)) {
-        log_hresult("CreateEx failed", hr);
-        if (hr == 0x80770009) {
-            std::wcerr << L"Hint: VD_E_NOTSUPPORTED - check VDConfig or configuration parameters.\n";
-        }
+        LOG_ERROR("CreateEx failed: %s",
+                   hresult_to_string(hr).c_str());
+        state_ = SessionState::FAILED;
         return false;
     }
 
-    std::cout << "VDI device set created successfully.\n";
-    std::cout << "Device set name: \"" << device_name_.c_str() << "\"\n";
-    std::cout << "Device count: " << device_count_ << "\n";
+    LOG_INFO("VDI device set created successfully.");
+    LOG_INFO("Device set name: \"%ws\"", device_name_.c_str());
+    LOG_INFO("Device count: %d", device_count_);
+
+    state_ = SessionState::CONNECTED;
     return true;
 #else
-    // Non-Windows placeholder - always succeeds
-    std::cout << "VDI device set created successfully\n";
+    LOG_INFO("VDI device set created successfully.");
+    state_ = SessionState::CONNECTED;
     return true;
 #endif
 }
 
 bool VdiClient::open_devices() {
+    // ── State guard: only CONNECTED → STREAMING ─────────────────────────
+    if (state_ != SessionState::CONNECTED) {
+        LOG_ERROR("open_devices() called in state %s (expected CONNECTED)",
+                   session_state_to_string(state_));
+        return false;
+    }
+
 #if defined(_WIN32)
     if (!device_set_) {
-        std::cerr << "No device set. Call connect() first.\n";
+        LOG_ERROR("No device set. Call connect() first.");
+        state_ = SessionState::FAILED;
         return false;
     }
 
     // Phase 1: GetConfiguration - this waits for SQL Server to connect
-    // to the named device set and negotiate configuration.
-    // If SQL Server is not connected, this will block until serverTimeOut
-    // and then fail with VD_E_TIMEOUT.
     VDConfig server_config = {};
-    std::cout << "Waiting for SQL Server to connect to device set \"" << device_name_.c_str() << "\"...\n";
-    std::cout << "(Execute: BACKUP DATABASE [db] TO VIRTUAL_DEVICE = N'" << device_name_.c_str() << "')\n";
+    LOG_INFO("Waiting for SQL Server to connect to device set \"%ws\"...",
+             device_name_.c_str());
+    LOG_INFO("(Execute: BACKUP DATABASE [db] TO VIRTUAL_DEVICE = N'%ws')",
+             device_name_.c_str());
 
     HRESULT hr = device_set_->GetConfiguration(60000, &server_config);
     if (FAILED(hr)) {
-        log_hresult("GetConfiguration failed", hr);
-        std::wcerr << L"Make sure SQL Server is running and a BACKUP ... TO VIRTUAL_DEVICE command\n";
-        std::wcerr << L"has been issued with device name \"" << device_name_.c_str() << L"\"\n";
-        if (hr == 0x8077000c) {
-            std::wcerr << L"Hint: VD_E_OBJECT - device set not ready. Connect SQL Server first.\n";
-        }
+        LOG_ERROR("GetConfiguration failed: %s",
+                   hresult_to_string(hr).c_str());
+        state_ = SessionState::FAILED;
         return false;
     }
 
-    std::cout << "SQL Server connected. Server configuration:\n";
-    std::cout << "  deviceCount: " << server_config.deviceCount << "\n";
-    std::cout << "  features: 0x" << std::hex << server_config.features << std::dec << "\n";
-    std::cout << "  serverTimeOut: " << server_config.serverTimeOut << "\n";
-    std::cout << "  blockSize: " << server_config.blockSize << "\n";
-    std::cout << "  maxTransferSize: " << server_config.maxTransferSize << "\n";
+    LOG_INFO("SQL Server connected. Server configuration:");
+    LOG_INFO("  deviceCount:    %lu", server_config.deviceCount);
+    LOG_INFO("  features:       0x%lx", server_config.features);
+    LOG_INFO("  serverTimeOut:  %lu", server_config.serverTimeOut);
+    LOG_INFO("  blockSize:      %lu", server_config.blockSize);
+    LOG_INFO("  maxTransferSize: %lu", server_config.maxTransferSize);
 
     // Phase 2: OpenDevice for each virtual device.
-    // The device name passed to OpenDevice must match the name used
-    // in BACKUP DATABASE ... TO VIRTUAL_DEVICE = N'<name>' in T-SQL.
-    // For deviceCount > 1, each device uses the same base name.
     for (int i = 0; i < static_cast<int>(server_config.deviceCount); ++i) {
 
         IClientVirtualDevice* device = nullptr;
@@ -142,100 +168,83 @@ bool VdiClient::open_devices() {
             &device);
 
         if (FAILED(hr)) {
-            log_hresult("OpenDevice failed", hr);
+            LOG_ERROR("OpenDevice failed: %s",
+                       hresult_to_string(hr).c_str());
+            state_ = SessionState::FAILED;
             return false;
         }
 
         devices_.push_back(device);
 
-        std::wcout << L"Opened virtual device " << i << L": \"" << device_name_ << L"\"\n";
+        LOG_INFO("Opened virtual device %d: \"%ws\"", i, device_name_.c_str());
     }
 
+    state_ = SessionState::STREAMING;
     return true;
 #else
-    // Non-Windows placeholder - always succeeds
+    state_ = SessionState::STREAMING;
     return true;
 #endif
 }
 
-bool VdiClient::get_next_chunk(uint8_t*& data, size_t& size) {
-    data = nullptr;
-    size = 0;
-
-    if (devices_.empty()) {
-        return false;
-    }
-
-    // GetCommand from the first virtual device (deviceCount=1)
-    // Blocks waiting for SQL Server to issue a command
-    auto device = devices_[0];
-    VDC_Command* cmd = nullptr;
-
-    HRESULT hr = device->GetCommand(INFINITE, &cmd);
-    if (FAILED(hr)) {
-        log_hresult("GetCommand failed", hr);
-        return false;
-    }
-
-    current_cmd_ = cmd;
-
-    switch (cmd->commandCode) {
-        case VDC_Write:
-            data = cmd->buffer;
-            size = cmd->size;
-            return true;
-
-        case VDC_Flush:
-            // Flush: just complete immediately
-            return true;
-
-        case VDC_ClearError:
-            // Clear error: just complete immediately
-            return true;
-
-        default:
-            // For any other command (VDC_Rewind, VDC_Read, VDC_Load, etc.),
-            // we process the buffer if any
-            if (cmd->size > 0 && cmd->buffer) {
-                data = cmd->buffer;
-                size = cmd->size;
-            }
-            return true;
-    }
-}
-
-void VdiClient::complete_chunk() {
-    if (!current_cmd_) {
+void VdiClient::close() {
+    // ── Idempotent close guard ──────────────────────────────────────────
+    if (devices_closed_) {
+        LOG_INFO("close() called again — already closed (idempotent).");
         return;
     }
 
-    auto cmd = static_cast<VDC_Command*>(current_cmd_);
-    auto device = devices_[0];
+    LOG_INFO("Closing VDI session (state=%s)...",
+             session_state_to_string(state_));
 
-    HRESULT hr = device->CompleteCommand(cmd, ERROR_SUCCESS, cmd->size, cmd->position);
-    if (FAILED(hr)) {
-        log_hresult("CompleteCommand failed", hr);
+    // Flush sink before releasing devices
+    if (sink_ && (state_ == SessionState::STREAMING ||
+                  state_ == SessionState::FLUSHING)) {
+        LOG_INFO("Flushing sink before device close...");
+        sink_->flush();
     }
 
-    current_cmd_ = nullptr;
-}
-
-void VdiClient::close() {
+    // Release all device interfaces
     for (auto device : devices_) {
         device->Release();
     }
     devices_.clear();
 
+    // Close and release the device set
     if (device_set_) {
         device_set_->Close();
+        device_set_->Release();
+        device_set_ = nullptr;
     }
+
+    devices_closed_ = true;
+    state_ = SessionState::CLOSED;
+
+    LOG_INFO("VDI session closed cleanly.");
 }
+
+// ── Per-chunk data flow ─────────────────────────────────────────────────
+// For each chunk:
+//   1. GetCommand()         → timed as getcommand_us
+//   2. Dispatch (switch)    → timed as dispatch_us
+//   3. Sink write           → timed as sink_us (only VDC_Write)
+//   4. CompleteCommand()    → timed as complete_us
+// ────────────────────────────────────────────────────────────────────────
 
 void VdiClient::process_commands() {
 
-    auto start = std::chrono::steady_clock::now();
+    // ── State guard: only STREAMING → process → FLUSHING/CLOSED ─────────
+    if (state_ != SessionState::STREAMING) {
+        LOG_ERROR("process_commands() called in state %s (expected STREAMING)",
+                   session_state_to_string(state_));
+        return;
+    }
 
     bool running = true;
+    uint64_t session_start_us = metrics_.now_us();
+    last_command_us_ = session_start_us;
+    last_bytes_total_ = 0;
+    last_stall_warn_us_ = session_start_us;
 
     while (running) {
 
@@ -243,137 +252,330 @@ void VdiClient::process_commands() {
 
             VDC_Command* cmd = nullptr;
 
-            auto cmd_start =
-                std::chrono::steady_clock::now();
+            // ── Stage 1: GetCommand with configurable timeout ───────────
+            uint64_t gc_start = metrics_.now_us();
 
             HRESULT hr = device->GetCommand(
-                INFINITE,
+                command_timeout_ms_,
                 &cmd);
 
-            auto cmd_end =
-                std::chrono::steady_clock::now();
+            uint64_t gc_end = metrics_.now_us();
+            uint64_t gc_us = gc_end - gc_start;
+
+            // Update stall detection timestamp
+            last_command_us_ = gc_end;
+
+            // Record GetCommand latency (legacy)
+            metrics_.record_getcommand_latency(
+                std::chrono::microseconds(gc_us));
 
             if (FAILED(hr)) {
-                // VD_E_CLOSE (0x80770001) and VD_E_EOF (0x8077000e) mean
-                // SQL Server finished and closed the connection.  These are
-                // the normal ways the command loop terminates in the real
-                // VDI protocol.  At this point cmd is NULL – do NOT pass
-                // it to handle_command.
                 if (hr == VD_E_CLOSE) {
-                    std::cout << "GetCommand returned VD_E_CLOSE – backup complete.\n";
+                    LOG_INFO("GetCommand returned VD_E_CLOSE — backup complete, initiating graceful shutdown.");
+                    // Graceful shutdown: flush sink, then transition
+                    state_ = SessionState::FLUSHING;
+                    if (sink_) {
+                        LOG_INFO("Flushing sink on VD_E_CLOSE...");
+                        sink_->flush();
+                    }
+                    running = false;
+                    break;
                 } else if (hr == VD_E_EOF) {
-                    std::cout << "GetCommand returned VD_E_EOF – backup complete.\n";
+                    LOG_INFO("GetCommand returned VD_E_EOF — backup complete.");
+                    state_ = SessionState::FLUSHING;
+                    if (sink_) {
+                        sink_->flush();
+                    }
+                    running = false;
+                    break;
+                } else if (hr == VD_E_TIMEOUT) {
+                    LOG_WARN("GetCommand timed out after %lu ms — checking progress...",
+                              command_timeout_ms_);
+                    check_stall(gc_end);
+                    // Continue the loop — a timeout may just mean a quiet period
+                    continue;
                 } else {
-                    log_hresult("GetCommand failed", hr);
+                    LOG_ERROR("GetCommand failed: %s",
+                               hresult_to_string(hr).c_str());
+                    state_ = SessionState::FAILED;
                 }
                 running = false;
                 break;
             }
 
-            if (SUCCEEDED(hr)) {
-                metrics_.record_getcommand_latency(
-                    std::chrono::duration_cast<
-                        std::chrono::microseconds>(
-                            cmd_end - cmd_start));
-            }
-
             if (!cmd) {
+                // Null command with success HRESULT is unexpected
+                LOG_WARN("GetCommand returned S_OK with null command — continuing...");
                 continue;
             }
 
-            /*std::cout << "Received command: "
-                      << command_to_string(cmd->commandCode)
-                      << " (code=" << cmd->commandCode << ")\n";*/
+            LOG_DEBUG("Received command: %s (code=%lu)",
+                       command_to_string(cmd->commandCode),
+                       cmd->commandCode);
 
-            handle_command(device, cmd);
+            // ── Stage 2: Dispatch (command dispatch + non-write work) ──
+            uint64_t dispatch_start = metrics_.now_us();
+            bool should_complete = handle_command(device, cmd);
+            uint64_t dispatch_end = metrics_.now_us();
+            uint64_t dispatch_us = dispatch_end - dispatch_start;
 
-            if (cmd->commandCode == VDC_Close) {
+            // Check if session entered FAILED state (e.g. sink write failure)
+            if (state_ == SessionState::FAILED) {
+                LOG_ERROR("Session entered FAILED state — aborting command loop.");
+                // Do NOT call CompleteCommand — device may be in an invalid state
                 running = false;
+                break;
             }
+
+            // VDC_Close: break out (no CompleteCommand)
+            if (!should_complete) {
+                running = false;
+                break;
+            }
+
+            // ── Stage 3: Sink write (only for VDC_Write) ───────────────
+            uint64_t sink_us = 0;
+            if (cmd->commandCode == VDC_Write && sink_) {
+
+                // Validate the write command before touching the buffer
+                if (!validate_write_command(cmd)) {
+                    LOG_ERROR("Invalid VDC_Write command detected — aborting.");
+                    state_ = SessionState::FAILED;
+                    running = false;
+                    break;
+                }
+
+                // Check sink health before writing
+                if (!sink_->is_open()) {
+                    LOG_ERROR("Sink is not open — cannot write data.");
+                    state_ = SessionState::FAILED;
+                    running = false;
+                    break;
+                }
+
+                uint64_t sink_start = metrics_.now_us();
+                {
+                    TRACE_EVENT("SinkWrite");
+                    bool write_ok = sink_->write(
+                        static_cast<uint8_t*>(cmd->buffer),
+                        cmd->size);
+
+                    if (!write_ok) {
+                        LOG_ERROR("Sink write failed — data loss possible.");
+                        state_ = SessionState::FAILED;
+                        running = false;
+                        break;
+                    }
+                }
+                uint64_t sink_end = metrics_.now_us();
+                sink_us = sink_end - sink_start;
+
+                metrics_.record_sink_latency(
+                    std::chrono::microseconds(sink_us));
+
+                // Update total bytes for stall detection
+                last_bytes_total_ = metrics_.total_bytes();
+            }
+
+            if (!running) break;  // exit loop if sink failure occurred
+
+            // ── Stage 4: CompleteCommand ───────────────────────────────
+            uint64_t cc_start = metrics_.now_us();
+
+            hr = device->CompleteCommand(cmd, ERROR_SUCCESS, cmd->size, cmd->position);
+
+            uint64_t cc_end = metrics_.now_us();
+            uint64_t cc_us = cc_end - cc_start;
+
+            metrics_.record_completecommand_latency(
+                std::chrono::microseconds(cc_us));
+
+            if (FAILED(hr)) {
+                LOG_ERROR("CompleteCommand failed: %s",
+                           hresult_to_string(hr).c_str());
+                state_ = SessionState::FAILED;
+                running = false;
+                break;
+            }
+
+            // ── Fault injection hook ────────────────────────────────────
+            if (fault_injector_.on_chunk_completed()) {
+                LOG_WARN("Fault injector triggered after %llu chunks — simulating failure.",
+                          static_cast<unsigned long long>(fault_injector_.chunk_count()));
+                state_ = SessionState::FAILED;
+                running = false;
+                break;
+            }
+
+            // ── Record full ChunkTiming ────────────────────────────────
+            uint64_t chunk_size = static_cast<uint64_t>(cmd->size);
+            uint64_t total_us = gc_us + dispatch_us + sink_us + cc_us;
+            uint64_t timestamp_us = gc_start - session_start_us;
+
+            ChunkTiming timing;
+            timing.size = chunk_size;
+            timing.getcommand_us = gc_us;
+            timing.dispatch_us = dispatch_us;
+            timing.sink_us = sink_us;
+            timing.complete_us = cc_us;
+            timing.total_us = total_us;
+            timing.timestamp_us = timestamp_us;
+
+            metrics_.record_chunk_timing(timing);
         }
     }
 
+    // ── Post-loop cleanup ────────────────────────────────────────────────
+    // If we transitioned to FLUSHING from VD_E_CLOSE, complete cleanup
+    if (state_ == SessionState::FLUSHING) {
+        close();
+    }
+
+    // Print human-readable summary
     metrics_.print_summary();
+
+    // Output machine-readable JSON for benchmark scripts
+    LOG_INFO("---BEGIN JSON METRICS---");
+    LOG_INFO("%s", metrics_.to_json().c_str());
+    LOG_INFO("---END JSON METRICS---");
+
+    // Log resource accounting summary
+    LOG_INFO("Resource accounting: max_active_buffers=%llu",
+              static_cast<unsigned long long>(max_active_buffers_));
 }
 
-void VdiClient::handle_command(
+bool VdiClient::validate_write_command(const VDC_Command* cmd) {
+    // Never trust protocol data blindly.
+    //
+    // Validate:
+    //   - Non-null buffer pointer
+    //   - Sane size (> 0, reasonable upper bound)
+    //   - Reasonable position offset
+
+    if (!cmd) {
+        LOG_ERROR("validate_write_command: cmd is null");
+        return false;
+    }
+
+    if (!cmd->buffer) {
+        LOG_ERROR("validate_write_command: buffer pointer is null");
+        return false;
+    }
+
+    if (cmd->size == 0) {
+        LOG_ERROR("validate_write_command: chunk size is 0");
+        return false;
+    }
+
+    // 1 GB upper bound — VDI protocol typically uses 1 MB max transfer size,
+    // but we set a generous safety limit to catch corrupt protocol data.
+    constexpr DWORD MAX_SANE_CHUNK_SIZE = 1024 * 1024 * 1024;  // 1 GB
+    if (cmd->size > MAX_SANE_CHUNK_SIZE) {
+        LOG_ERROR("validate_write_command: chunk size %lu exceeds sanity limit %lu",
+                   cmd->size, MAX_SANE_CHUNK_SIZE);
+        return false;
+    }
+
+    return true;
+}
+
+void VdiClient::check_stall(uint64_t now_us) {
+    // Stall detection: if no byte progress has been made in the
+    // STALL_WARN_MS window, log a warning.
+    //
+    // This detects:
+    //   - Hung SQL Server connections
+    //   - Blocked sinks
+    //   - Protocol deadlocks
+
+    if (last_stall_warn_us_ == 0) {
+        last_stall_warn_us_ = now_us;
+        return;
+    }
+
+    uint64_t elapsed_us = now_us - last_stall_warn_us_;
+    if (elapsed_us < static_cast<uint64_t>(STALL_WARN_MS) * 1000) {
+        return;  // Not enough time elapsed since last check
+    }
+
+    // Check if bytes have progressed
+    uint64_t current_bytes = metrics_.total_bytes();
+    if (current_bytes == last_bytes_total_) {
+        LOG_WARN("Possible stall detected — no byte progress for %lu ms "
+                  "(total_bytes=%llu, state=%s)",
+                  STALL_WARN_MS,
+                  static_cast<unsigned long long>(current_bytes),
+                  session_state_to_string(state_));
+        // Reset warning timer to avoid repeated logging every microsecond
+        last_stall_warn_us_ = now_us;
+    } else {
+        // Progress was made; reset tracking
+        last_bytes_total_ = current_bytes;
+        last_stall_warn_us_ = now_us;
+    }
+}
+
+bool VdiClient::handle_command(
     IClientVirtualDevice* device,
     VDC_Command* cmd) {
-
-    HRESULT hr = S_OK;
 
     switch (cmd->commandCode) {
 
     case VDC_Read:
-        std::cout << "  [" << command_to_string(cmd->commandCode) << "]\n";
-
-        // SQL Server requesting data read
-        // (not expected during a pure BACKUP; used for RESTORE)
+        LOG_DEBUG("  [VDC_Read]");
+        // SQL Server requesting data read (not expected during pure BACKUP)
         break;
 
-    case VDC_Write:
-        process_write(cmd);
+    case VDC_Write: {
+        // Record chunk size metrics (min/max/avg) and bytes before sink write
+        metrics_.record_chunk_size(cmd->size);
+        metrics_.add_bytes(cmd->size);
+
+        LOG_DEBUG("[WRITE] size=%zu", cmd->size);
+
+        // Buffer pool instrumentation: simulate acquire/release
+        {
+            TRACE_EVENT("BufferPool");
+            uint8_t* pool_buf = buffer_pool_.acquire();
+            bool acquired = (pool_buf != nullptr);
+            metrics_.record_buffer_acquire(acquired);
+
+            if (acquired) {
+                active_buffers_.fetch_add(1);
+                uint64_t cur = active_buffers_.load();
+                if (cur > max_active_buffers_) {
+                    max_active_buffers_ = cur;
+                }
+
+                buffer_pool_.release(pool_buf);
+                active_buffers_.fetch_sub(1);
+            }
+            metrics_.record_buffer_release();
+        }
+        // Note: actual sink write happens in process_commands() stage 3
+        // for independent timing.
         break;
+    }
 
     case VDC_Flush:
-        std::cout << "  [VDC_Flush]\n";
-
+        LOG_DEBUG("  [VDC_Flush]");
         if (sink_) {
             sink_->flush();
         }
-
         break;
 
     case VDC_ClearError:
-        std::cout << "  [" << command_to_string(cmd->commandCode) << "]\n";
+        LOG_DEBUG("  [VDC_ClearError]");
         break;
 
     case VDC_Close:
-        std::cout << "  [VDC_Close]\n";
-        return;
+        LOG_INFO("  [VDC_Close]");
+        return false;  // Signal caller to break out of loop (no CompleteCommand)
 
     default:
-        std::cout << "  [UNKNOWN COMMAND: " << cmd->commandCode << "]\n";
+        LOG_DEBUG("  [UNKNOWN COMMAND: %lu]", cmd->commandCode);
         break;
     }
 
-    // CompleteCommand requires 4 arguments:
-    //   (cmd, dwCompletionCode, dwBytesTransferred, dwlPosition)
-    hr = device->CompleteCommand(cmd, ERROR_SUCCESS, cmd->size, cmd->position);
-
-    if (FAILED(hr)) {
-        log_hresult("CompleteCommand failed", hr);
-    }
-}
-
-void VdiClient::process_write(
-    VDC_Command* writeCmd) {
-
-    auto start =
-        std::chrono::steady_clock::now();
-
-    auto* buffer =
-        static_cast<uint8_t*>(
-            writeCmd->buffer);
-
-    size_t size =
-        writeCmd->size;
-
-    metrics_.add_bytes(size);
-
-    /*std::cout << "[WRITE]"
-              << " size=" << size
-              << "\n";*/
-
-    if (sink_) {
-        sink_->write(buffer, size);
-    }
-
-    auto end =
-        std::chrono::steady_clock::now();
-
-    metrics_.record_chunk_latency(
-        std::chrono::duration_cast<
-            std::chrono::microseconds>(
-                end - start));
+    return true;  // Signal caller to call CompleteCommand + sink write timing
 }

@@ -6,7 +6,8 @@ Design:
   - Pure ctypes COM (no pywin32)
   - Direct vtable dispatch for IClientVirtualDeviceSet2 and IClientVirtualDevice
   - NullSink only (orchestration overhead measurement)
-  - Metrics matching C++ Metrics class
+  - Metrics matching C++ Metrics class (including chunk size, histogram, buffer pool)
+  - CPU utilization via GetProcessTimes
   - Zero logging during command loop
 """
 
@@ -158,18 +159,63 @@ ole32.CoCreateInstance.restype = HRESULT
 
 
 # ---------------------------------------------------------------------------
-# Metrics (mirrors C++ Metrics class)
+# GetProcessTimes wrapper
+# ---------------------------------------------------------------------------
+kernel32 = ctypes.windll.kernel32
+
+# BOOL GetProcessTimes(HANDLE, FILETIME*, FILETIME*, FILETIME*, FILETIME*)
+class FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime",  DWORD),
+        ("dwHighDateTime", DWORD),
+    ]
+
+kernel32.GetProcessTimes.argtypes = [
+    c_void_p, POINTER(FILETIME), POINTER(FILETIME),
+    POINTER(FILETIME), POINTER(FILETIME)
+]
+kernel32.GetProcessTimes.restype = BOOL
+
+# HANDLE GetCurrentProcess()
+kernel32.GetCurrentProcess.argtypes = []
+kernel32.GetCurrentProcess.restype = c_void_p
+
+
+def filetime_to_us(ft):
+    """Convert FILETIME to microseconds."""
+    ui = (ctypes.c_uint64(ft.dwHighDateTime) << 32) | ctypes.c_uint64(ft.dwLowDateTime)
+    return ui.value // 10
+
+
+# ---------------------------------------------------------------------------
+# Metrics (mirrors C++ Metrics class with all enhancements)
 # ---------------------------------------------------------------------------
 class Metrics:
     __slots__ = (
         'total_bytes', 'chunk_count',
+        'min_chunk_size', 'max_chunk_size', 'sum_chunk_sizes',
+        'hist_under_100us', 'hist_100us_1ms', 'hist_1ms_10ms', 'hist_over_10ms',
+        'buffer_acquire_count', 'buffer_release_count',
+        'buffer_pool_hits', 'buffer_pool_misses',
         'getcommand_latencies', 'chunk_latencies',
-        'start_time'
+        'start_time', 'logging_enabled'
     )
 
-    def __init__(self):
+    def __init__(self, enable_logging=False):
+        self.logging_enabled = enable_logging
         self.total_bytes = 0
         self.chunk_count = 0
+        self.min_chunk_size = 2**64 - 1  # UINT64_MAX sentinel
+        self.max_chunk_size = 0
+        self.sum_chunk_sizes = 0
+        self.hist_under_100us = 0
+        self.hist_100us_1ms = 0
+        self.hist_1ms_10ms = 0
+        self.hist_over_10ms = 0
+        self.buffer_acquire_count = 0
+        self.buffer_release_count = 0
+        self.buffer_pool_hits = 0
+        self.buffer_pool_misses = 0
         self.getcommand_latencies = []   # microseconds
         self.chunk_latencies = []        # microseconds
         self.start_time = time.perf_counter()
@@ -178,11 +224,38 @@ class Metrics:
         self.total_bytes += size
         self.chunk_count += 1
 
+    def record_chunk_size(self, size):
+        if size < self.min_chunk_size:
+            self.min_chunk_size = size
+        if size > self.max_chunk_size:
+            self.max_chunk_size = size
+        self.sum_chunk_sizes += size
+
     def record_chunk_latency(self, us):
         self.chunk_latencies.append(us)
 
     def record_getcommand_latency(self, us):
         self.getcommand_latencies.append(us)
+
+    def record_latency_histogram(self, us):
+        if us < 100:
+            self.hist_under_100us += 1
+        elif us < 1000:
+            self.hist_100us_1ms += 1
+        elif us < 10000:
+            self.hist_1ms_10ms += 1
+        else:
+            self.hist_over_10ms += 1
+
+    def record_buffer_acquire(self, success):
+        self.buffer_acquire_count += 1
+        if success:
+            self.buffer_pool_hits += 1
+        else:
+            self.buffer_pool_misses += 1
+
+    def record_buffer_release(self):
+        self.buffer_release_count += 1
 
     @staticmethod
     def _percentile(values, p):
@@ -201,26 +274,53 @@ class Metrics:
         mb = self.total_bytes / 1024.0 / 1024.0
         throughput = mb / elapsed if elapsed > 0 else 0.0
 
+        # --- Aggregate stats ---
         print(f"Bytes: {self.total_bytes}")
         print(f"Chunks: {self.chunk_count}")
 
+        # --- Chunk size stats ---
+        print("\nChunk Sizes:")
+        if self.chunk_count > 0:
+            cur_min = self.min_chunk_size if self.min_chunk_size != 2**64 - 1 else 0
+            cur_max = self.max_chunk_size
+            avg = self.sum_chunk_sizes // self.chunk_count if self.chunk_count > 0 else 0
+            print(f"  Min: {cur_min} bytes ({cur_min / 1024.0:.1f} KB)")
+            print(f"  Avg: {avg} bytes ({avg / 1024.0:.1f} KB)")
+            print(f"  Max: {cur_max} bytes ({cur_max / 1024.0:.1f} KB)")
+        else:
+            print("  (no data)")
+
         if self.chunk_count > 0:
             avg = self.total_bytes // self.chunk_count
-            print(f"\nAverage chunk size: {avg} bytes ({avg / 1024.0:.1f} KB)")
+            print(f"\nAverage chunk size (from totals): {avg} bytes ({avg / 1024.0:.1f} KB)")
 
+        # Total elapsed time
         print(f"\nTotal elapsed time: {elapsed:.1f} s")
 
-        # CPU utilization via GetProcessTimes (Win32)
+        # CPU utilization via GetProcessTimes
         try:
-            kernel_time = c_uint64(0)
-            user_time = c_uint64(0)
-            kernel_filetime = ctypes.wintypes.FILETIME()
-            user_filetime = ctypes.wintypes.FILETIME()
-            # We don't actually call GetProcessTimes because the embedded
-            # Python may have limited ctypes access. Skip CPU% for Python.
+            creation_time = FILETIME()
+            exit_time = FILETIME()
+            kernel_time = FILETIME()
+            user_time = FILETIME()
+            hproc = kernel32.GetCurrentProcess()
+            ret = kernel32.GetProcessTimes(
+                hproc, byref(creation_time), byref(exit_time),
+                byref(kernel_time), byref(user_time)
+            )
+            if ret:
+                kernel_us = filetime_to_us(kernel_time)
+                user_us = filetime_to_us(user_time)
+                total_cpu_us = kernel_us + user_us
+                wall_us = elapsed * 1_000_000.0
+                cpu_pct = (total_cpu_us / wall_us) * 100.0 if wall_us > 0 else 0.0
+                print(f"CPU utilization: {cpu_pct:.1f}%"
+                      f" (kernel={kernel_us // 1000} ms, user={user_us // 1000} ms,"
+                      f" total={total_cpu_us // 1000} ms)")
         except Exception:
             pass
 
+        # Throughput
         print(f"\nThroughput MB/s: {throughput:.1f}")
 
         # GetCommand latency
@@ -241,6 +341,37 @@ class Metrics:
             print(f"  P95: {self._percentile(self.chunk_latencies, 95)} us")
             print(f"  P99: {self._percentile(self.chunk_latencies, 99)} us")
 
+        # Latency histogram
+        total_samples = (self.hist_under_100us + self.hist_100us_1ms +
+                         self.hist_1ms_10ms + self.hist_over_10ms)
+        print("\nLatency Histogram (chunk processing):")
+        if total_samples == 0:
+            print("  (no samples)")
+        else:
+            def pct(count):
+                return (count / total_samples) * 100.0
+            print(f"  <100 us       {self.hist_under_100us:>8}  {pct(self.hist_under_100us):.1f}%")
+            print(f"  100 us-1 ms   {self.hist_100us_1ms:>8}  {pct(self.hist_100us_1ms):.1f}%")
+            print(f"  1 ms-10 ms    {self.hist_1ms_10ms:>8}  {pct(self.hist_1ms_10ms):.1f}%")
+            print(f"  >10 ms        {self.hist_over_10ms:>8}  {pct(self.hist_over_10ms):.1f}%")
+
+        # Buffer pool utilization
+        acquires = self.buffer_acquire_count
+        releases = self.buffer_release_count
+        hits = self.buffer_pool_hits
+        misses = self.buffer_pool_misses
+        reuse_rate = (hits / acquires) * 100.0 if acquires > 0 else 0.0
+        print(f"\nBuffer Pool:")
+        print(f"  Acquires:      {acquires}")
+        print(f"  Releases:      {releases}")
+        print(f"  Hits:          {hits}")
+        print(f"  Misses:        {misses}")
+        print(f"  Reuse rate:    {reuse_rate:.1f}%")
+
+        # Logging status
+        if self.logging_enabled:
+            print("\n* Logging was ON during this run")
+
         print()
 
 
@@ -248,17 +379,51 @@ class Metrics:
 # Python VDI Client (ctypes COM, mirrors C++ VdiClient)
 # ---------------------------------------------------------------------------
 class PyVdiClient:
-    def __init__(self):
-        self.metrics = Metrics()
+    def __init__(self, enable_logging=False):
+        self.logging_enabled = enable_logging
+        self.metrics = Metrics(enable_logging)
         self.device_set = None   # IClientVirtualDeviceSet2 COM pointer as c_void_p
         self.device = None       # IClientVirtualDevice COM pointer as c_void_p
         self.device_name = ""
         self.device_count = 0
 
+        # Simulated buffer pool (for allocation accounting)
+        self._pool_buffers = []
+        self._pool_available = []
+        self._POOL_SIZE = 64
+        self._BUFFER_SIZE = 64 * 1024
+        self._init_buffer_pool()
+
         # Initialize COM
         hr = ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
         if FAILED(hr):
             raise RuntimeError(f"CoInitializeEx failed: hr=0x{hr:08x}")
+
+    def _init_buffer_pool(self):
+        """Pre-allocate pool buffers (mirrors C++ BufferPool)."""
+        self._pool_buffers = [
+            bytearray(self._BUFFER_SIZE) for _ in range(self._POOL_SIZE)
+        ]
+        # Wrap in ctypes for acquire/release simulation
+        self._pool_available = list(range(self._POOL_SIZE))
+
+    def _pool_acquire(self):
+        """Simulate BufferPool::acquire(). Returns pointer or None."""
+        if self._pool_available:
+            idx = self._pool_available.pop(0)
+            buf = self._pool_buffers[idx]
+            # Return a ctypes pointer to the buffer's underlying memory
+            return (ctypes.c_uint8 * self._BUFFER_SIZE).from_buffer(buf)
+        return None
+
+    def _pool_release(self, buf):
+        """Simulate BufferPool::release()."""
+        # Find which slot this buffer belongs to (by identity)
+        for idx, b in enumerate(self._pool_buffers):
+            if ctypes.addressof(buf) == ctypes.addressof(
+                    (ctypes.c_uint8 * self._BUFFER_SIZE).from_buffer(b)):
+                self._pool_available.append(idx)
+                return
 
     def __del__(self):
         self.close()
@@ -283,28 +448,6 @@ class PyVdiClient:
                 f"failed: hr=0x{hr:08x}"
             )
         self.device_set = ppv
-
-    def _vtable_call(self, iface_ptr, slot, *args):
-        """
-        Call a virtual method on a COM interface via vtable dispatch.
-
-        slot 0 = QueryInterface
-        slot 1 = AddRef
-        slot 2 = Release
-        slot 3+ = custom methods
-        """
-        # vtable is at the start of the interface.
-        # Read the function pointer from the vtable.
-        vtable_ptr = ctypes.c_void_p.from_address(iface_ptr.value)
-        # vtable is an array of function pointers
-        fn_ptr_raw = ctypes.c_void_p.from_address(
-            vtable_ptr.value + slot * ctypes.sizeof(ctypes.c_void_p)
-        ).value
-        # Create a CFUNCTYPE for the call
-        # HRESULT __stdcall func(params)
-        func_type = ctypes.WINFUNCTYPE(HRESULT, *[type(a) for a in args])
-        func = func_type(fn_ptr_raw)
-        return func(*args)
 
     def connect(self, device_name, device_count):
         """Create device set via CreateEx. Mirrors C++ VdiClient::connect()."""
@@ -335,7 +478,6 @@ class PyVdiClient:
 
         # CreateEx vtable slot = 11 (3 IUnknown + 8 IClientVirtualDeviceSet + 0 CreateEx)
         # Signature: HRESULT CreateEx(LPCWSTR instanceName, LPCWSTR name, VDConfig* config)
-        # STDMETHODCALLTYPE = __stdcall, so first arg = 'this' (the interface pointer)
         CreateEx_t = ctypes.WINFUNCTYPE(
             HRESULT,
             c_void_p,        # this
@@ -369,9 +511,6 @@ class PyVdiClient:
         vtable = ctypes.c_void_p.from_address(ds_ptr).value
 
         # GetConfiguration: vtable slot 4
-        #   IUnknown: slots 0-2 (QI, AddRef, Release)
-        #   IClientVirtualDeviceSet: slot 3 = Create, slot 4 = GetConfiguration
-        # HRESULT GetConfiguration(DWORD timeout, VDConfig* config)
         GetConfiguration_t = ctypes.WINFUNCTYPE(
             HRESULT, c_void_p, DWORD, POINTER(VDConfig)
         )
@@ -402,10 +541,6 @@ class PyVdiClient:
         print(f"  maxTransferSize: {server_config.maxTransferSize}")
 
         # Phase 2: OpenDevice - vtable slot 5
-        #   IUnknown: slots 0-2
-        #   IClientVirtualDeviceSet: slot 3 = Create, slot 4 = GetConfiguration,
-        #                            slot 5 = OpenDevice
-        # HRESULT OpenDevice(LPCWSTR name, IClientVirtualDevice** ppDevice)
         OpenDevice_t = ctypes.WINFUNCTYPE(
             HRESULT, c_void_p, LPCWSTR, POINTER(PVOID)
         )
@@ -430,8 +565,7 @@ class PyVdiClient:
         dev_ptr = self.device.value
         vtable = ctypes.c_void_p.from_address(dev_ptr).value
 
-        # GetCommand: vtable slot 3 (3 IUnknown = slot 3)
-        # HRESULT GetCommand(DWORD timeout, VDC_Command** ppCmd)
+        # GetCommand: vtable slot 3
         GetCommand_t = ctypes.WINFUNCTYPE(
             HRESULT, c_void_p, DWORD, POINTER(POINTER(VDC_Command))
         )
@@ -441,7 +575,6 @@ class PyVdiClient:
         get_cmd = GetCommand_t(fn_gc)
 
         # CompleteCommand: vtable slot 4
-        # HRESULT CompleteCommand(VDC_Command* cmd, DWORD status, DWORD bytes, DWORDLONG position)
         CompleteCommand_t = ctypes.WINFUNCTYPE(
             HRESULT, c_void_p, POINTER(VDC_Command), DWORD, DWORD, DWORDLONG
         )
@@ -478,23 +611,24 @@ class PyVdiClient:
 
             cmd = pp_cmd.contents
 
-            # NO logging during benchmark (comment out if debugging needed)
-            # print(f"Received command: code={cmd.commandCode}")
+            if self.logging_enabled:
+                print(f"Received command: code={cmd.commandCode}")
 
             # Handle commands (same dispatch as C++)
             hr2 = 0  # S_OK
             if cmd.commandCode == VDC_Write:
                 self._process_write(cmd)
             elif cmd.commandCode == VDC_Flush:
+                if self.logging_enabled:
+                    print("  [VDC_Flush]")
                 # NullSink: no flush needed
-                pass
             elif cmd.commandCode == VDC_Close:
                 print("  [VDC_Close]")
                 running = False
                 continue
             else:
-                # Unknown command - just complete
-                pass
+                if self.logging_enabled:
+                    print(f"  [UNKNOWN COMMAND: {cmd.commandCode}]")
 
             # CompleteCommand: 4 args (cmd, ERROR_SUCCESS, size, position)
             cc_hr = complete_cmd(dev_ptr, pp_cmd, ERROR_SUCCESS, cmd.size, cmd.position)
@@ -507,16 +641,32 @@ class PyVdiClient:
     def _process_write(self, cmd):
         """Process a VDC_Write command. NullSink: no actual I/O."""
         start = time.perf_counter()
+
+        # Record chunk size metrics (min/max/avg)
+        self.metrics.record_chunk_size(cmd.size)
+
         self.metrics.add_bytes(cmd.size)
+
+        if self.logging_enabled:
+            print(f"[WRITE] size={cmd.size}")
+
+        # Buffer pool instrumentation: simulate acquire/release
+        pool_buf = self._pool_acquire()
+        self.metrics.record_buffer_acquire(pool_buf is not None)
+        if pool_buf is not None:
+            self._pool_release(pool_buf)
+        self.metrics.record_buffer_release()
+
         # NullSink: data is ignored, just track timing
         end = time.perf_counter()
         latency_us = int((end - start) * 1_000_000)
+
         self.metrics.record_chunk_latency(latency_us)
+        self.metrics.record_latency_histogram(latency_us)
 
     def close(self):
         """Release resources."""
         if self.device is not None:
-            # Release via vtable slot 2
             try:
                 dev_ptr = self.device.value
                 vtable = ctypes.c_void_p.from_address(dev_ptr).value
@@ -531,15 +681,10 @@ class PyVdiClient:
             self.device = None
 
         if self.device_set is not None:
-            # Close via vtable slot 6
-            #   IUnknown: slots 0-2
-            #   IClientVirtualDeviceSet: slot 3 = Create, slot 4 = GetConfiguration,
-            #                            slot 5 = OpenDevice, slot 6 = Close
             try:
                 ds_ptr = self.device_set.value
                 vtable = ctypes.c_void_p.from_address(ds_ptr).value
 
-                # Close: slot 6
                 Close_t = ctypes.WINFUNCTYPE(HRESULT, c_void_p)
                 fn_close = ctypes.c_void_p.from_address(
                     vtable + 6 * ctypes.sizeof(ctypes.c_void_p)
@@ -547,7 +692,6 @@ class PyVdiClient:
                 close = Close_t(fn_close)
                 close(ds_ptr)
 
-                # Release: slot 2
                 Release_t = ctypes.WINFUNCTYPE(HRESULT, c_void_p)
                 fn_rel = ctypes.c_void_p.from_address(
                     vtable + 2 * ctypes.sizeof(ctypes.c_void_p)

@@ -14,6 +14,7 @@ public:
         size_t size) override;
 
     void flush() override;
+    bool is_open() const override;
 
 private:
     void flush_buffer();
