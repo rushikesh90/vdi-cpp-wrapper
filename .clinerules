@@ -4,13 +4,20 @@
 # library for backup pipeline instrumentation.
 #
 # Key files to understand first:
-#   1. include/vdi_client.h     — Main class interface + SessionState machine
-#   2. src/vdi_client.cpp       — Command loop, hardening, state transitions
-#   3. include/sqlvdi.h         — COM interface definitions (critical vtable)
-#   4. include/metrics.h        — Throughput + latency tracking
-#   5. include/sink.h           — Pluggable output sink (NullSink|FileSink)
-#   6. include/error_utils.h    — HRESULT translation + SessionState enum
-#   7. docs/operational-behavior.md — Shutdown, timeout, retry, cleanup docs
+#   1. include/vdi_client.h     — Public API (no protocol leakage)
+#   2. src/vdi_client.cpp       — Session lifecycle, state transitions, command loop
+#   3. src/vdi_protocol.h/.cpp  — Internal VDI protocol handling (isolated)
+#   4. include/sqlvdi.h         — COM interface definitions (critical vtable)
+#   5. include/metrics.h        — Throughput + latency tracking
+#   6. include/sink.h           — Pluggable output sink (NullSink|FileSink)
+#   7. include/com_runtime.h    — RAII COM initialisation wrapper
+#   8. include/environment.h    — Benchmark environment metadata capture
+#   9. include/error_utils.h    — HRESULT translation + SessionState enum
+#  10. docs/operational-behavior.md — Shutdown, timeout, retry, cleanup docs
+#  11. docs/design-decisions.md     — Architectural rationale
+#  12. docs/glossary.md             — Terminology reference
+#  13. QUICKSTART.md                — 5-step onboarding guide
+#  14. include/version.h            — v0.1.0 version tracking
 #
 # Build (MSVC x64, from repo root):
 #   vcvars64.bat  # from VS install

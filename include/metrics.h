@@ -1,8 +1,20 @@
 #pragma once
 
+// ---------------------------------------------------------------------------
+// Metrics collection for VDI backup pipeline instrumentation.
+//
+// Tracks:
+//   - Total bytes and chunk count (atomic for stall detection)
+//   - Per-chunk timing breakdowns via ChunkTiming vector
+//   - Per-stage latency percentiles (P50/P95/P99) from ChunkTiming data
+//   - CPU utilisation via GetProcessTimes (Windows-only)
+//   - Buffer pool high-water mark (caller-reported)
+// ---------------------------------------------------------------------------
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <memory>
 
@@ -11,58 +23,55 @@
 
 class Metrics {
 public:
-    Metrics(std::unique_ptr<Timer> timer = std::make_unique<ChronoTimer>(),
-            bool enable_logging = false);
+    explicit Metrics(std::unique_ptr<Timer> timer = std::make_unique<ChronoTimer>(),
+                     bool enable_logging = false);
+    ~Metrics() = default;
 
+    // No copy or move
+    Metrics(const Metrics&) = delete;
+    Metrics& operator=(const Metrics&) = delete;
+    Metrics(Metrics&&) = delete;
+    Metrics& operator=(Metrics&&) = delete;
+
+    // ── Byte and chunk accounting ─────────────────────────────────────────
     void add_bytes(size_t size);
-
     void record_chunk_size(size_t size);
 
-    // Record timing for each chunk individually (full vector storage)
+    // ── Per-chunk timing ──────────────────────────────────────────────────
+    // Records a full ChunkTiming struct. This is the primary recording path;
+    // all per-stage latencies and distributions are derived from the stored
+    // ChunkTiming vector.
     void record_chunk_timing(const ChunkTiming& timing);
 
-    // Legacy: record aggregated latencies (kept for backward compat)
-    void record_chunk_latency(
-        std::chrono::microseconds latency);
-
-    void record_getcommand_latency(
-        std::chrono::microseconds latency);
-
-    // New: record CompleteCommand latency separately
-    void record_completecommand_latency(
-        std::chrono::microseconds latency);
-
-    // Record sink write latency separately
-    void record_sink_latency(
-        std::chrono::microseconds latency);
-
-    void record_latency_histogram(uint64_t us);
-
+    // ── Buffer pool instrumentation ───────────────────────────────────────
     void record_buffer_acquire(bool success);
     void record_buffer_release();
 
-    // Access to full ChunkTiming vector for post-processing / JSON export
-    const std::vector<ChunkTiming>& timings() const { return timings_; }
-
-    // Public timer accessor for hot-path timing in VdiClient
+    // ── Timing accessor for hot-path use ──────────────────────────────────
     uint64_t now_us() const { return timer_->now_us(); }
 
-    // Total bytes transferred (for stall detection and diagnostics)
+    // ── Accessors for diagnostics and JSON export ─────────────────────────
     uint64_t total_bytes() const { return total_bytes_.load(); }
+    uint64_t chunk_count() const { return chunk_count_.load(); }
+    const std::vector<ChunkTiming>& timings() const { return timings_; }
 
-    // Public accessors for hot-path retrieval
-    const std::vector<uint64_t>& sink_latencies() const { return sink_latencies_; }
-
+    // ── Output ────────────────────────────────────────────────────────────
     void print_summary() const;
 
     // Machine-readable JSON output for benchmark scripts.
-    // Returns a JSON string with all metrics (throughput, latency, CPU, etc.)
+    // Includes throughput, per-stage latency distributions, CPU%, and
+    // environment metadata.
     std::string to_json() const;
 
 private:
+    // Compute the p-th percentile from a sorted vector of values.
     static uint64_t percentile(
         const std::vector<uint64_t>& values,
         double p);
+
+    // Extract a stage vector from timings_ for percentile computation.
+    std::vector<uint64_t> stage_values(
+        uint64_t ChunkTiming::*field) const;
 
     // The timer used for this session
     std::unique_ptr<Timer> timer_;
@@ -79,27 +88,14 @@ private:
     std::atomic<uint64_t> max_chunk_size_;
     std::atomic<uint64_t> sum_chunk_sizes_;
 
-    // Latency histogram buckets (chunk processing, microseconds)
-    std::atomic<uint64_t> hist_under_100us_;   // <100 µs
-    std::atomic<uint64_t> hist_100us_1ms_;     // 100 µs – 1 ms
-    std::atomic<uint64_t> hist_1ms_10ms_;      // 1 ms – 10 ms
-    std::atomic<uint64_t> hist_over_10ms_;     // >10 ms
-
     // Buffer pool accounting
     std::atomic<uint64_t> buffer_acquire_count_;
     std::atomic<uint64_t> buffer_release_count_;
     std::atomic<uint64_t> buffer_pool_hits_;
     std::atomic<uint64_t> buffer_pool_misses_;
 
-    // Latency samples (microseconds).
-    // NOTE: currently accessed from a single thread (command loop).
-    // If ever used from multiple threads, a mutex must be added.
-    std::vector<uint64_t> getcommand_latencies_;
-    std::vector<uint64_t> chunk_latencies_;
-    std::vector<uint64_t> completecommand_latencies_;
-    std::vector<uint64_t> sink_latencies_;
-
-    // Full per-chunk timing breakdowns (the most valuable data)
+    // Full per-chunk timing breakdowns (the most valuable data).
+    // All per-stage latencies (P50/P95/P99) are derived from this vector.
     std::vector<ChunkTiming> timings_;
 
     std::chrono::steady_clock::time_point start_time_;

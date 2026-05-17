@@ -1,21 +1,24 @@
 #pragma once
 
-#if defined(_WIN32)
-#include <windows.h>
-#include <combaseapi.h>
-#include "sqlvdi.h"
-#else
-// Non-Windows placeholder definitions to allow compilation on other platforms
-typedef void* IClientVirtualDeviceSet2;
-typedef void* IClientVirtualDevice;
-typedef int HRESULT;
-#define S_OK 0
-#define FAILED(hr) ((hr) != S_OK)
-#define COINIT_MULTITHREADED 0
-inline HRESULT CoInitializeEx(void*, unsigned int) { return S_OK; }
-inline void CoUninitialize() {}
-inline HRESULT CoCreateInstance(const void*, void*, unsigned int, const void*, void**) { return S_OK; }
-#endif
+// ---------------------------------------------------------------------------
+// VDI Client — high-level API for SQL Server VDI backup streaming.
+//
+// Public API:
+//   VdiClient(std::unique_ptr<Sink> sink, ...)
+//   bool connect(device_name, device_count)
+//   bool open_devices()
+//   void process_commands()
+//   void close()
+//   void set_command_timeout(ms)
+//   const Metrics& metrics()
+//   SessionState state()
+//   FaultInjector& fault_injector()
+//
+// All VDI protocol types (VDC_Command, VDConfig, COM interfaces) are
+// isolated in internal implementation files. The public header exposes
+// only opaque void* pointers for COM handles.
+// ---------------------------------------------------------------------------
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -49,14 +52,23 @@ public:
               TimerMode timer_mode = TimerMode::Chrono);
     ~VdiClient();
 
+    // No copy or move
+    VdiClient(const VdiClient&) = delete;
+    VdiClient& operator=(const VdiClient&) = delete;
+    VdiClient(VdiClient&&) = delete;
+    VdiClient& operator=(VdiClient&&) = delete;
+
     // ── Public API ──────────────────────────────────────────────────────
     // Connect to a VDI device set. Blocks until SQL Server connects or
     // the operation times out (default: 60 s).
     bool connect(const std::wstring& device_name, int device_count);
 
-    // Open virtual devices and enter the command loop.
-    // Blocks until backup completes and calls metrics_.print_summary()
-    // and metrics_.to_json() on exit.
+    // Open virtual devices after SQL Server has connected.
+    // Blocks until GetConfiguration succeeds.
+    bool open_devices();
+
+    // Run the blocking command loop (backup data flow).
+    // Blocks until backup completes and prints summary / JSON metrics.
     void process_commands();
 
     // Close all open devices and release COM resources.
@@ -69,11 +81,7 @@ public:
     // Set to INFINITE (0xFFFFFFFF) to disable timeout (original behavior).
     void set_command_timeout(unsigned long timeout_ms);
 
-    // ── Internal (public for testing) ───────────────────────────────────
-    // Open the virtual devices after SQL Server has connected.
-    bool open_devices();
-
-    // Access to metrics (for post-benchmark inspection)
+    // ── Diagnostics ─────────────────────────────────────────────────────
     const Metrics& metrics() const { return metrics_; }
 
     // Current session state (for testing and diagnostics)
@@ -83,29 +91,21 @@ public:
     FaultInjector& fault_injector() { return fault_injector_; }
 
 private:
-    // Handle a single command. Returns true if the command should be
-    // completed (i.e. all non-Close commands). Returns false for VDC_Close
-    // so the caller can break out of the command loop.
-    // Sets state_ to FAILED on unrecoverable errors (e.g. sink write failure).
-    bool handle_command(IClientVirtualDevice* device,
-                        VDC_Command* cmd);
-
-    // Validate that a VDC_Write command contains sane parameters.
-    // Returns true if the command is valid, false otherwise.
-    bool validate_write_command(const VDC_Command* cmd);
-
     // Update stall detection state. Logs a warning if no byte progress
     // has been made within the stall detection window.
     void check_stall(uint64_t now_us);
 
-    IClientVirtualDeviceSet2* device_set_;
-    void* current_cmd_;
+    // Opaque COM handles — cast to actual types in the .cpp implementation.
+    // Using void* avoids forward-declaration conflicts with COM interface
+    // keyword definitions in sqlvdi.h.
+    void* device_set_;
 
+    // Sink and metrics
     std::unique_ptr<Sink> sink_;
     Metrics metrics_;
     BufferPool buffer_pool_{BUFFER_SIZE, BUFFER_POOL_SIZE};
 
-    std::vector<IClientVirtualDevice*> devices_;
+    // Session parameters
     std::wstring device_name_;
     int device_count_;
 
@@ -122,13 +122,13 @@ private:
     unsigned long command_timeout_ms_;
 
     // ── Stall detection ─────────────────────────────────────────────────
-    uint64_t last_command_us_;       // steady_clock micros at last GetCommand call
-    uint64_t last_bytes_total_;      // total_bytes at last progress check
-    uint64_t last_stall_warn_us_;    // steady_clock micros at last stall warning
+    uint64_t last_command_us_;
+    uint64_t last_bytes_total_;
+    uint64_t last_stall_warn_us_;
 
     // ── Resource accounting ─────────────────────────────────────────────
-    std::atomic<uint64_t> active_buffers_;     // buffers currently acquired
-    uint64_t max_active_buffers_;              // high-water mark
+    std::atomic<uint64_t> active_buffers_;
+    uint64_t max_active_buffers_;
 
     // ── Fault injection hook ────────────────────────────────────────────
     FaultInjector fault_injector_;

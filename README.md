@@ -2,17 +2,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Native C++ implementation of SQL Server **Virtual Device Interface (VDI)** streaming
-used to study backup pipeline latency, runtime overhead, and buffer management
-behavior compared to Python-based orchestration.
+Minimal native C++ implementation of SQL Server's **Virtual Device Interface (VDI)**
+streaming protocol with per-chunk latency instrumentation.
 
-Instrumentation spans the full lifecycle:
+The library wraps the COM-based VDI protocol into a clean public API
+(`VdiClient`, `Sink`, `Metrics`, `BufferPool`) while keeping protocol
+internals (`VDC_Command`, `VDConfig`, `IClientVirtualDeviceSet2`)
+isolated in implementation files.
 
-    GetCommand() → command dispatch → sink.write() → CompleteCommand()
+Instrumentation decomposes each chunk's lifecycle into four independently
+timed stages:
 
-Each stage is timed independently, with per-chunk breakdowns (P50/P95/P99),
-kernel/user CPU decomposition, and logging overhead measured scientifically
-(3 build configurations: OFF / INFO / DEBUG).
+```
+GetCommand() → dispatch → sink.write() → CompleteCommand()
+```
+
+Per-stage latencies (P50/P95/P99), throughput, and CPU utilization are
+reported in both human-readable and machine-readable JSON format.
 
 ---
 
@@ -108,30 +114,17 @@ Full vectors are stored (not running sums), enabling:
 
 ## Logging Overhead Measurement
 
-Three build configurations allow scientific measurement of logging overhead:
+Three build configurations allow measurement of logging overhead:
 
-| Level | `#define LOGGING_LEVEL` | Binary | What's Compiled |
-|-------|------------------------|--------|-----------------|
-| OFF | 0 | `vdi_wrapper_no_logging.exe` | Only `LOG_ERROR` — zero debug/info overhead |
-| INFO | 1 | `vdi_wrapper_info.exe` | Session lifecycle events, no per-chunk tracing |
-| DEBUG | 2 | `vdi_wrapper_debug.exe` | Full per-chunk `LOG_DEBUG` + `TRACE_EVENT` RAII |
+| Level | `LOGGING_LEVEL` | Binary | What's Compiled |
+|-------|-----------------|--------|-----------------|
+| OFF | 0 | `vdi_wrapper_no_logging` | Only `LOG_ERROR` — zero debug/info overhead |
+| INFO | 1 | `vdi_wrapper_info` | Session lifecycle events, no per-chunk tracing |
+| DEBUG | 2 | `vdi_wrapper_debug` | Full per-chunk `LOG_DEBUG` + `TRACE_EVENT` RAII |
 
 Compile-time elimination guarantees the OFF binary has **zero** debug-path
 overhead in the hot path — no branch prediction changes, no formatting,
 no iostream/mutex state touched.
-
-### Building each configuration
-
-```powershell
-# OFF  (no logging)
-cl /DLOGGING_LEVEL=0 src\*.cpp /EHsc /std:c++17 /link ole32.lib
-
-# INFO (default, or omit)
-cl /DLOGGING_LEVEL=1 src\*.cpp /EHsc /std:c++17 /link ole32.lib
-
-# DEBUG (trace events + debug logging)
-cl /DLOGGING_LEVEL=2 src\*.cpp /EHsc /std:c++17 /link ole32.lib
-```
 
 ### TRACE_EVENT RAII
 
@@ -161,71 +154,10 @@ to use the high-resolution Windows counter.
 
 ---
 
-## Benchmark Methodology
+## Quickstart
 
-The project includes reproducible benchmark scripts that compare C++ (native COM)
-against Python (ctypes COM) implementations. See:
-
-- [`docs/benchmark-methodology.md`](docs/benchmark-methodology.md) — Workload,
-  environment, protocol, and reproducibility checklist
-- [`benchmarks/results/results.md`](benchmarks/results/results.md) — Latest
-  benchmark results with full environment documentation
-- [`docs/runtime-analysis.md`](docs/runtime-analysis.md) — Runtime behavior,
-  chunk distribution, scheduler effects, logging impact, tail latency,
-  allocation stability
-
-### Quick benchmark run
-
-```powershell
-# C++ benchmark (builds, runs, outputs JSON)
-.\scripts\run_cpp_benchmark.ps1
-
-# Python benchmark (same pattern)
-.\scripts\run_python_benchmark.ps1
-```
-
-Both scripts:
-1. Build the client (C++ or Python)
-2. Prompt for the T-SQL `BACKUP DATABASE ... TO VIRTUAL_DEVICE` command
-3. Collect metrics and output machine-readable JSON
-
----
-
-## Results
-
-| Metric | C++ | Python |
-|--------|-----|--------|
-| Throughput | XX.X MB/s | XX.X MB/s |
-| P50 GetCommand | XX µs | XX µs |
-| P50 CompleteCommand | XX µs | XX µs |
-| P50 sink write | XX µs | XX µs |
-| P95 sink write | XX µs | XX µs |
-| P99 sink write | XX µs | XX µs |
-| CPU utilization | XX% | XX% |
-
-*(Values pending first benchmark run — see
-[results](benchmarks/results/results.md) for the latest numbers and
-[runtime-analysis.md](docs/runtime-analysis.md) for detailed observations.)*
-
----
-
-## API Surface
-
-The public API is intentionally minimal:
-
-```cpp
-class VdiClient {
-public:
-    // Connect to VDI device set
-    bool connect(const std::wstring& device_name, int device_count);
-
-    // Run the blocking command loop (backup data flow)
-    void process_commands();
-};
-```
-
-That's it. Protocol ugliness (`VDC_Command`, `VDConfig`, COM interface pointers)
-stays in `sqlvdi.h` — never leaks into caller code.
+See [QUICKSTART.md](QUICKSTART.md) for a 5-step guide to building and running
+your first benchmark in under 30 minutes.
 
 ---
 
@@ -235,13 +167,13 @@ stays in `sqlvdi.h` — never leaks into caller code.
 
 | Requirement | Version |
 |---|---|
-| Windows | Windows Server 2022+ |
+| Windows | Windows Server 2022+ or Windows 11 |
 | SQL Server | SQL Server 2019+ (Developer Edition is free) |
 | Visual Studio | 2022 with "Desktop development with C++" |
 | VDI SDK | Included with SQL Server (`C:\Program Files\Microsoft SQL Server\...\COM\`) |
 | CMake | 3.16+ |
 
-### Build
+### Using CMake
 
 ```powershell
 mkdir build
@@ -252,30 +184,34 @@ cmake --build . --config Release
 
 The binary `vdi_wrapper.exe` will be at `build\bin\Release\vdi_wrapper.exe`.
 
-### Build from source (MSVC CLI)
+### Using MSVC CLI
 
 ```powershell
-# Set up environment (paths will differ on your machine)
-$env:Path = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64;" + $env:Path
-$env:INCLUDE = "...\include;...\Windows Kits\10\Include\10.0.26100.0\ucrt;..."
-$env:LIB = "...\lib\x64;..."
-
-# OFF logging build
-cl /DLOGGING_LEVEL=0 src\sqlvdi_guids.cpp /c /EHsc /std:c++17 /Fosqlvdi_guids.obj
-cl /DLOGGING_LEVEL=0 src\vdi_client.cpp /c /EHsc /std:c++17 /Fovdi_client.obj
-cl /DLOGGING_LEVEL=0 src\metrics.cpp /c /EHsc /std:c++17 /Fometrics.obj
-cl /DLOGGING_LEVEL=0 src\main.cpp /c /EHsc /std:c++17 /Fomain.obj
-cl /DLOGGING_LEVEL=0 src\buffer_pool.cpp /c /EHsc /std:c++17 /Fobuffer_pool.obj
-cl /DLOGGING_LEVEL=0 src\file_sink.cpp /c /EHsc /std:c++17 /Fofile_sink.obj
-
-link *.obj /OUT:vdi_wrapper_no_logging.exe ole32.lib /SUBSYSTEM:CONSOLE
+# Open "x64 Native Tools Command Prompt for VS 2022" first
+cl src\*.cpp /EHsc /std:c++17 /I include /Fe:vdi_wrapper.exe ole32.lib
 ```
+
+---
+
+## Benchmark Methodology
+
+See [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for:
+- Workload definition (database size, device count, sink type)
+- Environment specification (VM, OS, SQL Server version)
+- Protocol for running reproducible benchmarks
+- Caveats and known sources of variance
+- Repeatability check procedure
+
+See [docs/design-decisions.md](docs/design-decisions.md) for architectural
+rationale.
+
+See [benchmarks/results/](benchmarks/results/) for latest benchmark results.
 
 ---
 
 ## VDI Protocol Flow
 
-See [`docs/vdi-flow.md`](docs/vdi-flow.md) for a complete description of the
+See [docs/vdi-flow.md](docs/vdi-flow.md) for a complete description of the
 VDI lifecycle, command loop, and data flow.
 
 ---
@@ -306,12 +242,32 @@ The implementation includes defense-in-depth for production use:
   human-readable strings (`hresult_to_string`) in addition to hex codes.
 - **Resource accounting**: Active buffer counts and high-water marks are tracked
   and logged at session end to detect leaks.
-- **Human-readable error codes**: `hresult_to_string()` maps all VDI protocol
-  error codes and common COM errors to descriptive text.
 
-See [`docs/operational-behavior.md`](docs/operational-behavior.md) for detailed
+See [docs/operational-behavior.md](docs/operational-behavior.md) for detailed
 documentation of the session state machine, shutdown sequencing, timeout
 configuration, cleanup guarantees, retry policy, and fault injection hooks.
+
+---
+
+## API Surface
+
+The public API is intentionally minimal:
+
+```cpp
+class VdiClient {
+public:
+    bool connect(const std::wstring& device_name, int device_count);
+    bool open_devices();
+    void process_commands();
+    void close();
+    void set_command_timeout(unsigned long timeout_ms);
+    const Metrics& metrics() const;
+    SessionState state() const;
+};
+```
+
+Protocol types (`VDC_Command`, `VDConfig`, COM interface pointers) are
+isolated in internal implementation files — never exposed in the public API.
 
 ---
 
@@ -331,6 +287,13 @@ While significantly hardened, the following limitations remain:
 
 If you need any of these, this repository serves as a reference implementation
 to build upon, not a turnkey backup solution.
+
+---
+
+## Glossary
+
+See [docs/glossary.md](docs/glossary.md) for definitions of VDI, COM, VSS,
+tail latency, throughput, chunk, and other terms used throughout this project.
 
 ---
 

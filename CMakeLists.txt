@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(vdi_wrapper VERSION 0.1 LANGUAGES CXX)
+project(vdi_wrapper VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,60 +13,56 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(VDI_SOURCES
     src/main.cpp
     src/vdi_client.cpp
+    src/vdi_protocol.cpp
     src/file_sink.cpp
     src/metrics.cpp
     src/buffer_pool.cpp
     src/sqlvdi_guids.cpp
     src/error_utils.cpp
     src/fault_injector.cpp
+    src/com_runtime.cpp
+    src/environment.cpp
 )
 
-# ── No-Logging build (OFF) ──────────────────────────────────────────────
-add_executable(vdi_wrapper_no_logging EXCLUDE_FROM_ALL ${VDI_SOURCES})
-target_include_directories(vdi_wrapper_no_logging PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_features(vdi_wrapper_no_logging PRIVATE cxx_std_17)
-target_compile_definitions(vdi_wrapper_no_logging PRIVATE LOGGING_LEVEL=0)
-if(MSVC)
-    target_compile_options(vdi_wrapper_no_logging PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(vdi_wrapper_no_logging PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-target_link_libraries(vdi_wrapper_no_logging PRIVATE ole32 uuid)
+# ── Common include directories ──────────────────────────────────────────
+set(VDI_INCLUDES
+    ${CMAKE_SOURCE_DIR}/include
+)
 
-# ── Info build (INFO, default) ──────────────────────────────────────────
-add_executable(vdi_wrapper_info EXCLUDE_FROM_ALL ${VDI_SOURCES})
-target_include_directories(vdi_wrapper_info PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_features(vdi_wrapper_info PRIVATE cxx_std_17)
-target_compile_definitions(vdi_wrapper_info PRIVATE LOGGING_LEVEL=1)
-if(MSVC)
-    target_compile_options(vdi_wrapper_info PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(vdi_wrapper_info PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-target_link_libraries(vdi_wrapper_info PRIVATE ole32 uuid)
+# ── Common link libraries ───────────────────────────────────────────────
+set(VDI_LIBS
+    ole32
+    uuid
+)
 
-# ── Debug/Trace build (DEBUG) ───────────────────────────────────────────
-add_executable(vdi_wrapper_debug EXCLUDE_FROM_ALL ${VDI_SOURCES})
-target_include_directories(vdi_wrapper_debug PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_features(vdi_wrapper_debug PRIVATE cxx_std_17)
-target_compile_definitions(vdi_wrapper_debug PRIVATE LOGGING_LEVEL=2)
+# ── Warning flags ────────────────────────────────────────────────────────
 if(MSVC)
-    target_compile_options(vdi_wrapper_debug PRIVATE /W4 /permissive-)
+    set(VDI_WARNINGS /W4 /permissive- /WX)
 else()
-    target_compile_options(vdi_wrapper_debug PRIVATE -Wall -Wextra -Wpedantic)
+    set(VDI_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 endif()
-target_link_libraries(vdi_wrapper_debug PRIVATE ole32 uuid)
 
-# ── Default target: info logging ────────────────────────────────────────
-add_executable(vdi_wrapper ${VDI_SOURCES})
-target_include_directories(vdi_wrapper PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_features(vdi_wrapper PRIVATE cxx_std_17)
-if(MSVC)
-    target_compile_options(vdi_wrapper PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(vdi_wrapper PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-target_link_libraries(vdi_wrapper PRIVATE ole32 uuid)
+# ── Helper: add a target with a specific logging level ───────────────────
+function(add_vdi_target TARGET_NAME LOG_LEVEL)
+    add_executable(${TARGET_NAME} ${VDI_SOURCES})
+    target_include_directories(${TARGET_NAME} PRIVATE ${VDI_INCLUDES})
+    target_compile_features(${TARGET_NAME} PRIVATE cxx_std_17)
+    target_compile_definitions(${TARGET_NAME} PRIVATE LOGGING_LEVEL=${LOG_LEVEL})
+    target_compile_options(${TARGET_NAME} PRIVATE ${VDI_WARNINGS})
+    target_link_libraries(${TARGET_NAME} PRIVATE ${VDI_LIBS})
+endfunction()
+
+# ── No-Logging build (OFF, LOGGING_LEVEL=0) ──────────────────────────────
+add_vdi_target(vdi_wrapper_no_logging 0)
+
+# ── Info build (INFO, LOGGING_LEVEL=1) ───────────────────────────────────
+add_vdi_target(vdi_wrapper_info 1)
+
+# ── Debug/Trace build (DEBUG, LOGGING_LEVEL=2) ──────────────────────────
+add_vdi_target(vdi_wrapper_debug 2)
+
+# ── Default target: info logging (LOGING_LEVEL=1) ───────────────────────
+add_vdi_target(vdi_wrapper 1)
 
 install(TARGETS vdi_wrapper
     RUNTIME DESTINATION bin

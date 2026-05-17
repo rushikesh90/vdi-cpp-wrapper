@@ -24,7 +24,7 @@ performance, add your sink of choice and measure separately.
 
 ## Environment
 
-All benchmarks run identically configured instances:
+All benchmarks run on identically configured instances unless otherwise noted:
 
 | Item | Value |
 |---|---|
@@ -53,23 +53,49 @@ All benchmarks run identically configured instances:
 
 ## Metrics
 
-All metrics are computed from the client-side timestamps:
+All metrics are computed from client-side timestamps:
 
 - **Throughput (MB/s)**: `total_bytes / 1024² / elapsed_wall_seconds`
-- **GetCommand latency**: Time spent blocked waiting for SQL Server to deliver
-  the next command (P50 / P95 / P99 in µs).
-- **Chunk processing latency**: Time from receiving a `VDC_Write` to calling
-  `CompleteCommand` (P50 / P95 / P99 in µs).
+- **Per-stage latencies**: Each chunk's lifecycle is decomposed into four stages:
+  - `getcommand_us`: Time blocked waiting for SQL Server to deliver the next command
+  - `dispatch_us`: Command dispatch overhead (switch + decision logic)
+  - `sink_us`: Time spent in `sink->write()` (the actual I/O)
+  - `complete_us`: Time spent in `CompleteCommand()` (SQL sync / flow control)
 - **CPU utilization**: User + Kernel CPU time from `GetProcessTimes`, expressed
   as percentage of wall-clock time.
+
+Latencies are reported as P50/P95/P99 in microseconds, computed from the full
+`ChunkTiming` vector (not running sums).
 
 ## Controlled Variables
 
 - **Same workload**: Database is re-created with the same size before each run.
 - **Same sink**: NullSink used in both C++ and Python benchmarks.
 - **Same VM**: Benchmarks run on the same Azure instance, back-to-back.
-- **Logging disabled**: `LOG_DEBUG` is compiled out; `LOG_INFO` suppressed at
-  runtime during benchmark runs.
+- **Logging disabled**: `LOG_DEBUG` compiled out; `LOGGING_LEVEL=0` during
+  benchmark runs.
+
+## Benchmark Caveats
+
+The following limitations apply to all benchmark results:
+
+- **Single-device stream**: All measurements use exactly one virtual device.
+  Multi-device parallelism is not tested.
+- **No concurrent workloads**: SQL Server runs in isolation with no other
+  queries or backups during measurement.
+- **Local sink only**: Data is discarded (NullSink) or written to local disk
+  (FileSink). No network storage, cloud storage, or tape targets.
+- **No compression or encryption**: Raw data only. Compression/encryption
+  would add CPU overhead not captured here.
+- **NullSink benchmarks measure protocol overhead only**: Results with
+  NullSink do not represent realistic backup performance — they isolate the
+  VDI protocol path.
+- **SQL Server version dependency**: Results may vary with SQL Server version,
+  edition, and cumulative update level.
+- **Hardware dependency**: Results on different VM SKUs, physical hardware,
+  or storage configurations will differ.
+- **No restore pipeline**: Only the BACKUP path (VDC_Write) is instrumented.
+  RESTORE (VDC_Read) is not tested.
 
 ## Known Sources of Variance
 
@@ -78,6 +104,18 @@ All metrics are computed from the client-side timestamps:
 - VM hypervisor steal time (Azure burstable SKUs)
 - Paging (ensure sufficient RAM for both SQL Server and benchmark client)
 
+## Repeatability Check
+
+Run the included repeatability script to measure variance:
+
+```powershell
+.\scripts\run_repeatability_check.ps1 -BinaryPath .\build\bin\Release\vdi_wrapper.exe
+```
+
+A coefficient of variation (CV) below 2% is considered excellent; below 5%
+is acceptable. If CV exceeds 5%, investigate environment noise before
+publishing results.
+
 ## Reproducibility Checklist
 
 - [ ] Same VM SKU and configuration
@@ -85,5 +123,7 @@ All metrics are computed from the client-side timestamps:
 - [ ] Same database size and name
 - [ ] Same VDI device name
 - [ ] No other VDI clients running concurrently
-- [ ] Logging compiled out (`/DLOG_ENABLE_DEBUG` NOT defined)
+- [ ] Logging compiled out (`LOGGING_LEVEL=0`)
 - [ ] 5 runs, median reported
+- [ ] Sink specified in results (NullSink or FileSink)
+- [ ] Environment metadata captured (OS, CPU, RAM, SQL version)
